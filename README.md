@@ -6,7 +6,7 @@ code path that could send anything else (the one line that writes a request
 hard-codes the method, and the tests fail if that changes). Changes to the
 cluster go through commits to
 [ckopsa/home-infrastructure](https://github.com/ckopsa/home-infrastructure),
-which CI plans and applies on merge after approval; this server only looks.
+which CI plans and applies on merge; this server only looks.
 
 It needs Python 3.11 and nothing else: no dependency outside the standard
 library.

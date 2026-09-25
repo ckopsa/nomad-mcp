@@ -27,7 +27,7 @@ INSTRUCTIONS = (
     "a placement that failed, node_status for a node. Ids may be given as prefixes. "
     "To change the cluster, edit the ckopsa/home-infrastructure repository (job specs are "
     "terraform/nomad-jobs/<job>.hcl, variables and wiring in terraform/*.tf) and open a pull "
-    "request: CI plans it, and applies it on merge after approval."
+    "request: CI plans it, and applies it on merge."
 )
 
 

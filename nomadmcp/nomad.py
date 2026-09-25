@@ -1,9 +1,9 @@
 """The Nomad HTTP API client. It only ever sends GET.
 
 WHY GET ONLY: this server is for looking. A change to the cluster goes
-through a commit to ckopsa/home-infrastructure, which CI plans, a person
-approves, and CI applies on merge. A troubleshooting tool that could also
-stop a job or write a variable would be a second, unreviewed path to
+through a commit to ckopsa/home-infrastructure, which CI plans on the
+pull request and applies on merge. A troubleshooting tool that could also
+stop a job or write a variable would be a second, unrecorded path to
 production, so there is no such code path here: the one place that
 talks to the socket hard-codes the method, and no function takes a
 method or a body. The tests hold that line.
