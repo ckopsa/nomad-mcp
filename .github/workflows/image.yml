@@ -1,0 +1,114 @@
+# Builds the server's image and rolls the Nomad job onto it.
+#
+# WHY GHCR: a hosted runner cannot reach a home cluster's registry, and
+# a public repo is the wrong place for cluster credentials. GHCR is free
+# for public repos and authenticates with the built-in GITHUB_TOKEN.
+#
+# WHY arm64 NATIVELY: the cluster's node is ARM64, and public repos get
+# free arm64 runners, so the runner is the target and qemu never enters.
+#
+# THE TAG IS THE BARE SHORT SHA, the same the Makefile's IMAGE_TAG
+# computes, so a laptop deploy and a CI deploy name one image.
+#
+# THE DEPLOY IS ONE VARIABLE. The job template in the infra repo reads
+# nomad/jobs/nomad-mcp/deploy and restarts the task on the new tag. The
+# server has no state and no migration, so nothing stands between the
+# push and the roll. Without NOMAD_ADDR and NOMAD_TOKEN in this repo's
+# secrets the deploy step says so and stops; the image is still pushed.
+#
+# That variable write is the only write anywhere in this repository, and
+# it is CI's, not the server's: the server itself only ever sends GET.
+
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nomadmcp/**'
+      - 'pyproject.toml'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/image.yml'
+  pull_request:
+    paths:
+      - 'nomadmcp/**'
+      - 'pyproject.toml'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/image.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag
+        id: tag
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # A pull request proves the image builds; it publishes nothing.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/nomad-mcp
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.sha }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: hashicorp/setup-nomad@v1.0.0
+      - name: Point the job at the new image
+        env:
+          NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+          NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NOMAD_ADDR:-}" ] || [ -z "${NOMAD_TOKEN:-}" ]; then
+            echo "no NOMAD_ADDR / NOMAD_TOKEN in this repository's secrets: the image is pushed and nothing is rolled"
+            exit 0
+          fi
+          nomad var put -force \
+            nomad/jobs/nomad-mcp/deploy \
+            image_tag="$TAG" >/dev/null
+          echo "deploying ghcr.io/${{ github.repository_owner }}/nomad-mcp:${TAG}"
