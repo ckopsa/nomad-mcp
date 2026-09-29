@@ -8,6 +8,7 @@ GET ever left the client. Any other method is recorded and answered 405.
 The shapes are trimmed copies of what a Nomad 2.0 agent answers.
 """
 
+import base64
 import json
 import os
 import socketserver
@@ -305,6 +306,8 @@ class FakeNomad:
 
     def __init__(self, unix_path=None, forbid=()):
         self.requests = []
+        self.execs = []  # (alloc, task, argv, stdin) for each exec that ran
+        self.hung_up = threading.Event()  # set when a sleep exec saw the client close
         self.forbid = tuple(forbid)
         handler = self._handler()
         if unix_path:
@@ -362,8 +365,58 @@ class FakeNomad:
                 if any(path.startswith(p) for p in fake.forbid):
                     self._answer(403, "Permission denied")
                     return
+                if path.endswith("/exec") and self.headers.get("Upgrade", "").lower() == "websocket":
+                    self._exec(path, query)
+                    return
                 status, body = routes(path, query)
                 self._answer(status, body)
+
+            def _exec(self, path, query):
+                """Canned commands: cat echoes stdin, flood writes 100 KB, sleep waits
+                for the hang-up, fail exits 3; anything else echoes its argv."""
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.end_headers()
+                self.close_connection = True
+                argv = json.loads(query.get("command", "[]"))
+                stdin, message = b"", {}
+                while not (message.get("stdin") or {}).get("close"):
+                    message = self._ws_read()
+                    if message is None:
+                        return
+                    stdin += base64.b64decode((message.get("stdin") or {}).get("data", ""))
+                fake.execs.append((path.split("/")[4], query.get("task"), argv, stdin))
+                name = argv[0] if argv else ""
+                if name == "sleep":
+                    while self._ws_read() is not None:
+                        pass
+                    fake.hung_up.set()
+                    return
+                out = {"cat": stdin, "flood": b"x" * 100000 + b"END"}.get(
+                    name, " ".join(argv).encode() + b"\n")
+                for start in range(0, len(out), 30000):
+                    self._ws_send({"stdout": {"data": base64.b64encode(out[start:start + 30000]).decode()}})
+                if name == "fail":
+                    self._ws_send({"stderr": {"data": base64.b64encode(b"boom\n").decode()}})
+                self._ws_send({"exited": True, "result": {"exit_code": 3 if name == "fail" else 0}})
+
+            def _ws_send(self, message):
+                data = json.dumps(message).encode()
+                size = len(data)
+                head = bytes([0x81, size]) if size < 126 else bytes([0x81, 126]) + size.to_bytes(2, "big")
+                self.wfile.write(head + data)
+
+            def _ws_read(self):
+                head = self.rfile.read(2)
+                if len(head) < 2 or head[0] & 0x0F == 0x8:
+                    return None
+                size = head[1] & 0x7F
+                if size == 126:
+                    size = int.from_bytes(self.rfile.read(2), "big")
+                mask = self.rfile.read(4)
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(size)))
+                return json.loads(data)
 
             def _refuse(self):
                 self._record()

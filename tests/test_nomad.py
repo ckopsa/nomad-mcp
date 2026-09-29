@@ -84,7 +84,8 @@ class TestGetOnly(unittest.TestCase):
                  ("node_status", {"node": "orangepi5plus"}), ("list_services", {}),
                  ("service", {"name": "web"}), ("list_variables", {}),
                  ("list_deployments", {"active_only": False}), ("evaluation", {"eval": "e7e7e7"})]
-        self.assertEqual(sorted(name for name, _ in calls), sorted(tools.TOOLS))
+        # alloc_exec is the one tool that is not a read; test_exec.py holds it.
+        self.assertEqual(sorted(name for name, _ in calls), sorted(set(tools.TOOLS) - {"alloc_exec"}))
         for name, args in calls:
             answer, refused = tools.call(client, name, args)
             self.assertFalse(refused, (name, answer))

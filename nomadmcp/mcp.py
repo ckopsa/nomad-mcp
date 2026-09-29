@@ -21,8 +21,8 @@ PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "nomad-mcp"
 MAX_BODY = 1024 * 1024
 INSTRUCTIONS = (
-    "This server reads a HashiCorp Nomad cluster and changes nothing: every tool is "
-    "read-only. Start with cluster_overview, then follow what it names: job_status and "
+    "This server reads a HashiCorp Nomad cluster: every tool is read-only but alloc_exec, "
+    "which runs one command inside an allocation of an allow-listed job. Start with cluster_overview, then follow what it names: job_status and "
     "job_versions for a job, alloc_status and alloc_logs for an allocation, evaluation for "
     "a placement that failed, node_status for a node. Ids may be given as prefixes. "
     "To change the cluster, edit the ckopsa/home-infrastructure repository (job specs are "
@@ -38,7 +38,9 @@ def tool_list():
             "name": spec["name"],
             "description": spec["description"],
             "inputSchema": spec["schema"],
-            "annotations": {"readOnlyHint": True, "openWorldHint": False},
+            "annotations": ({"readOnlyHint": True, "openWorldHint": False}
+                            if spec.get("read_only", True) else
+                            {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}),
         }
         for spec in tools.TOOL_SPECS
     ]
