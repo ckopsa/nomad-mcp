@@ -54,6 +54,13 @@ class TestAllocExec(ToolCase):
                       'exit_code=0', log.getvalue())
         self.assertNotIn("line one", log.getvalue())
 
+    def test_a_call_without_a_why_runs_and_logs_why_null(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+            answer = self.call("alloc_exec", job="web", command=["fail", "now"])
+        self.assertEqual(answer["exit_code"], 3)
+        self.assertIn('exec job=web alloc=a1b2c3d4 task=server argv=["fail", "now"] why=null '
+                      'exit_code=3', log.getvalue())
+
     def test_output_past_64_kb_is_cut_to_its_tail(self):
         answer = self.exec(command=["flood"])
         self.assertTrue(answer["truncated"])
