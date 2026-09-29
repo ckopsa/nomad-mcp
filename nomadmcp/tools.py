@@ -1127,7 +1127,7 @@ def alloc_exec(client, args):
     stdin = args.get("stdin")
     if stdin is not None and not isinstance(stdin, str):
         raise Refusal("input", field="stdin", reason="a text is necessary")
-    why = _text(args, "why", required=True)
+    why = _text(args, "why")
     timeout = _int(args, "timeout_seconds", EXEC_DEFAULT_TIMEOUT, 1, EXEC_CEILING_TIMEOUT)
     if args.get("alloc"):
         alloc_id = resolve(client, "allocation", args.get("alloc"))
@@ -1258,7 +1258,7 @@ TOOL_SPECS = [
             "command is an argv array with no shell: pass [\"sh\", \"-c\", \"...\"] for one. "
             "alloc defaults to the job's newest running allocation; task may be left out when "
             "there is one. timeout_seconds is 60 by default and 300 at most. There is no TTY. "
-            "why is one sentence for the log. A job not on the allow-list is refused."
+            "why is one optional sentence for the log. A job not on the allow-list is refused."
         ),
         "schema": _schema({
             "job": _JOB,
@@ -1268,8 +1268,9 @@ TOOL_SPECS = [
                         "description": "The argv to run, for example [\"ls\", \"-la\", \"/local\"]."},
             "stdin": {"type": "string", "description": "Text written to the command's standard input."},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": EXEC_CEILING_TIMEOUT},
-            "why": {"type": "string", "description": "One sentence: why this command runs."},
-        }, ["job", "command", "why"]),
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["job", "command"]),
     },
     {
         "name": "list_nodes",
