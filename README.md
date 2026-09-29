@@ -1,12 +1,13 @@
 # nomad-mcp
 
 A small MCP server for troubleshooting a HashiCorp Nomad cluster. It is
-**read-only**: it sends nothing but `GET` to the Nomad API, and there is no
-code path that could send anything else (the one line that writes a request
-hard-codes the method, and the tests fail if that changes). Changes to the
-cluster go through commits to
+**read-only but for one tool**: every read goes through a client that sends
+nothing but `GET` (the one line that writes a request hard-codes the method,
+and the tests fail if that changes). The exception is `alloc_exec`, which runs
+one command inside an allocation of a job on an allow-list (below). Changes to
+the cluster go through commits to
 [ckopsa/home-infrastructure](https://github.com/ckopsa/home-infrastructure),
-which CI plans and applies on merge; this server only looks.
+which CI plans and applies on merge.
 
 It needs Python 3.11 and nothing else: no dependency outside the standard
 library.
@@ -35,6 +36,7 @@ The same environment the `nomad` CLI reads:
 | `NOMAD_CACERT` | a CA bundle for an https address (optional) |
 | `NOMAD_MCP_HOST` | the address `--http` listens on; `127.0.0.1` when unset |
 | `NOMAD_MCP_URL` | where `call` sends; `http://127.0.0.1:8111/mcp/` when unset |
+| `NOMAD_MCP_EXEC_JOBS` | the jobs `alloc_exec` may reach, comma-separated; empty or unset refuses every call |
 
 In production the server runs as a Nomad task and talks to the **Task API**:
 the task's `identity { env = true }` puts its workload identity in
@@ -56,6 +58,7 @@ that matches more than one is refused with the candidates listed.
 | `job_versions` | Recent versions with the diff from each one's predecessor as `old -> new` lines. |
 | `alloc_status` | One allocation: statuses and descriptions, each task's state, restarts and last events (exit codes, driver errors), resources, ports. |
 | `alloc_logs` | The tail of a task's stderr or stdout, 8000 bytes by default, 64000 at most. |
+| `alloc_exec` | Runs one command (an argv, no shell, no TTY, optional stdin) in the job's newest running allocation or a named one of it, and gives the exit code, stdout and stderr, each capped at 64 KB with the tail kept. The timeout is 60 s by default and 300 s at most; past it the exec is closed, which ends the command, and the answer says so. A job not in `NOMAD_MCP_EXEC_JOBS` is refused (`job_not_allowed`) before Nomad is asked anything; an allocation of another job is refused (`alloc_not_in_job`). Each call is logged on stderr (job, alloc, task, argv, why, exit code), never its stdin or output. |
 | `list_nodes`, `node_status` | Nodes; one node's attributes, driver and CSI health, capacity against allocations, drain, events. |
 | `list_services`, `service` | Nomad native services (with Traefik `Host()` rules); one service's registrations. |
 | `list_variables` | Variable paths and modify times. **Never values.** |
@@ -80,6 +83,7 @@ Every endpoint the server reads, and the capability it needs:
 | `/v1/vars` (list only) | list_variables | namespace `variables` path `list` |
 | `/v1/nodes`, `/v1/node/:id`, `/v1/node/:id/allocations` | overview, nodes, node_status, service | `node` read |
 | `/v1/plugins?type=csi` | overview | `plugin` read |
+| `/v1/client/allocation/:id/exec` (websocket) | alloc_exec | namespace `alloc-exec` |
 
 ```hcl
 namespace "default" {
@@ -98,6 +102,9 @@ Attach it to the job's workload identity:
 `nomad acl policy apply -namespace default -job nomad-mcp nomad-mcp-read nomad-mcp.policy.hcl`.
 A section the token may not read shows up in `cluster_overview` under
 `unavailable`; any other tool refuses with the path that was forbidden.
+
+`alloc_exec` also needs `alloc-exec`, which this policy leaves out: a separate
+policy in ckopsa/home-infrastructure grants it.
 
 ## Development
 

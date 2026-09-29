@@ -11,15 +11,19 @@ A refusal is a Refusal exception with a name and its data. A failed
 read of Nomad (unreachable, 403, 404) is a refusal too. No tool gives a
 stack trace.
 
-Nothing here writes. The client has no method that could.
+Nothing here writes but alloc_exec, which runs one command through
+execws for a job on its allow-list. The client has no method that could.
 """
 
+import json
+import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from . import execws
 from .nomad import NomadError
 
 
@@ -1098,6 +1102,61 @@ def evaluation(client, args):
     return answer
 
 
+# ------------------------------------------------------------------- exec
+
+
+EXEC_DEFAULT_TIMEOUT = 60
+EXEC_CEILING_TIMEOUT = 300
+
+
+def exec_jobs(environ=None):
+    """The jobs alloc_exec may reach, from NOMAD_MCP_EXEC_JOBS. Empty refuses all."""
+    env = os.environ if environ is None else environ
+    return {job.strip() for job in (env.get("NOMAD_MCP_EXEC_JOBS") or "").split(",") if job.strip()}
+
+
+def alloc_exec(client, args):
+    """The one tool that changes anything. The allow-list is judged before
+    Nomad hears a word, and the allocation must be the job's own."""
+    job = _text(args, "job", required=True)
+    if job not in exec_jobs():
+        raise Refusal("job_not_allowed", job=job)
+    argv = args.get("command")
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        raise Refusal("input", field="command", reason="an argv array of texts is necessary")
+    stdin = args.get("stdin")
+    if stdin is not None and not isinstance(stdin, str):
+        raise Refusal("input", field="stdin", reason="a text is necessary")
+    why = _text(args, "why", required=True)
+    timeout = _int(args, "timeout_seconds", EXEC_DEFAULT_TIMEOUT, 1, EXEC_CEILING_TIMEOUT)
+    if args.get("alloc"):
+        alloc_id = resolve(client, "allocation", args.get("alloc"))
+    else:
+        running = [a for a in _get(client, "/v1/job/%s/allocations" % _quote(job)) or []
+                   if a.get("ClientStatus") == "running"]
+        if not running:
+            raise Refusal("no_running_alloc", job=job)
+        alloc_id = max(running, key=lambda a: a.get("CreateTime") or 0)["ID"]
+    alloc = _get(client, "/v1/allocation/%s" % alloc_id)
+    if alloc.get("JobID") != job:
+        raise Refusal("alloc_not_in_job", job=job, alloc=short(alloc_id), alloc_job=alloc.get("JobID"))
+    tasks = sorted((alloc.get("TaskStates") or {}).keys())
+    task = _text(args, "task") or (tasks[0] if len(tasks) == 1 else None)
+    if task not in tasks:
+        raise Refusal("input", field="task", reason="name one of the allocation's tasks", tasks=tasks)
+    # The log names what ran and why; never its stdin or its output.
+    line = "nomad-mcp exec job=%s alloc=%s task=%s argv=%s why=%s" % (
+        job, short(alloc_id), task, json.dumps(argv)[:500], json.dumps(why)[:300])
+    try:
+        result = execws.run(client, alloc_id, task, argv, stdin, timeout)
+    except execws.ExecError as exc:
+        print(line + " refused=nomad", file=sys.stderr)
+        raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+    print(line + " exit_code=%s timed_out=%s" % (result["exit_code"], result["timed_out"]),
+          file=sys.stderr)
+    return dict({"job": job, "alloc": short(alloc_id), "task": task}, **result)
+
+
 # ------------------------------------------------------------------ specs
 
 
@@ -1188,6 +1247,29 @@ TOOL_SPECS = [
             "stream": {"type": "string", "enum": ["stderr", "stdout"]},
             "tail_bytes": {"type": "integer", "minimum": 1, "maximum": CEILING_TAIL},
         }, ["alloc"]),
+    },
+    {
+        "name": "alloc_exec",
+        "function": alloc_exec,
+        "read_only": False,
+        "description": (
+            "Runs one command inside a running allocation of a job on the exec allow-list and "
+            "gives its exit code, stdout and stderr (each capped at 64 KB, the tail kept). "
+            "command is an argv array with no shell: pass [\"sh\", \"-c\", \"...\"] for one. "
+            "alloc defaults to the job's newest running allocation; task may be left out when "
+            "there is one. timeout_seconds is 60 by default and 300 at most. There is no TTY. "
+            "why is one sentence for the log. A job not on the allow-list is refused."
+        ),
+        "schema": _schema({
+            "job": _JOB,
+            "alloc": _ALLOC,
+            "task": {"type": "string", "description": "The task name inside the allocation."},
+            "command": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                        "description": "The argv to run, for example [\"ls\", \"-la\", \"/local\"]."},
+            "stdin": {"type": "string", "description": "Text written to the command's standard input."},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": EXEC_CEILING_TIMEOUT},
+            "why": {"type": "string", "description": "One sentence: why this command runs."},
+        }, ["job", "command", "why"]),
     },
     {
         "name": "list_nodes",
