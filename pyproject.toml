@@ -3,6 +3,7 @@ name = "nomad-mcp"
 version = "0.1.0"
 description = "A small, read-only MCP server for troubleshooting a Nomad cluster."
 readme = "README.md"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.11"
 # None, on purpose: the server is the standard library and nothing else.
 dependencies = []
