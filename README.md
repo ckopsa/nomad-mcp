@@ -119,3 +119,8 @@ CI (`.github/workflows/image.yml`) builds on an arm64 runner, pushes
 `ghcr.io/ckopsa/nomad-mcp:<short sha>` and `latest` from `main`, and points the
 job at the new tag by writing `nomad/jobs/nomad-mcp/deploy`. That write is CI's,
 with CI's own token; the server's token only reads.
+
+## License
+
+Copyright (C) 2026 Colton Kopsa. Licensed under the GNU Affero General Public
+License v3.0 or later; see [LICENSE](LICENSE).
