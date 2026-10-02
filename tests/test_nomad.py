@@ -88,7 +88,8 @@ class TestGetOnly(unittest.TestCase):
         calls = [("cluster_overview", {}), ("list_jobs", {}), ("job_status", {"job": "web"}),
                  ("job_versions", {"job": "web"}), ("alloc_status", {"alloc": "a1b2c3"}),
                  ("alloc_logs", {"alloc": "a1b2c3"}), ("list_nodes", {}),
-                 ("node_status", {"node": "orangepi5plus"}), ("list_services", {}),
+                 ("node_status", {"node": "orangepi5plus"}), ("node_host", {"node": "orangepi5plus"}),
+                 ("list_services", {}),
                  ("service", {"name": "web"}), ("list_variables", {}),
                  ("list_deployments", {"active_only": False}), ("evaluation", {"eval": "e7e7e7"})]
         # alloc_exec and job_restart are not reads; test_exec.py holds them.
