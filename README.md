@@ -71,6 +71,7 @@ each job's namespace.
 | `alloc_exec` | Runs one command (an argv, no shell, no TTY, optional stdin) in the job's newest running allocation or a named one of it, and gives the exit code, stdout and stderr, each capped at 64 KB with the tail kept. The timeout is 60 s by default and 300 s at most; past it the exec is closed, which ends the command, and the answer says so. A job not in `NOMAD_MCP_EXEC_JOBS` is refused (`job_not_allowed`) before Nomad is asked anything; an allocation of another job is refused (`alloc_not_in_job`). Each call is logged on stderr (job, alloc, task, argv, why, exit code), never its stdin or output. `why` is optional, because a gate in front of this server may hold the why itself and strip it before forwarding; without one the log writes `why=null`. |
 | `job_restart` | Stops each running allocation of a job (`POST /v1/allocation/:id/stop`), so the scheduler places fresh ones: a fresh allocation pulls its image again and re-renders its templates, which an in-place task restart may not. It answers at once with `{job, namespace, stopped, evals}` and never waits for the new allocations; `job_status` follows them. A job whose `namespace/job` is not in `NOMAD_MCP_RESTART_JOBS` is refused (`job_not_allowed`) before Nomad is asked anything. Each call is logged on stderr (job, namespace, allocs, why); `why` is optional, as for `alloc_exec`. |
 | `list_nodes`, `node_status` | Nodes; one node's attributes, driver and CSI health, capacity against allocations, drain, events. |
+| `node_host` | One node's host from its client's stats: each disk's device, mountpoint, size, use and inode use, the alloc dir's disk, memory and uptime; the client's GC thresholds and `gc_max_allocs` (from node meta of the same name, else Nomad's defaults, named as such: no API carries a client's agent config); the allocations it holds, running and terminal; and `gc_pressure`, what makes the client collect dead allocations, logs included, at once. A client the servers cannot reach is named under `unreadable`. |
 | `list_services`, `service` | Nomad native services (with Traefik `Host()` rules); one service's registrations. |
 | `list_variables` | Variable paths and modify times. **Never values.** |
 | `list_deployments`, `evaluation` | Deployments (active by default); one evaluation's placement failures in words. |
@@ -92,7 +93,8 @@ Every endpoint the server reads, and the capability it needs:
 | `/v1/services`, `/v1/service/:name` | list_services, service | namespace `read-job` |
 | `/v1/client/fs/logs/:alloc` | alloc_logs | namespace `read-logs` |
 | `/v1/vars` (list only) | list_variables | namespace `variables` path `list` |
-| `/v1/nodes`, `/v1/node/:id`, `/v1/node/:id/allocations` | overview, nodes, node_status, service | `node` read |
+| `/v1/nodes`, `/v1/node/:id`, `/v1/node/:id/allocations` | overview, nodes, node_status, node_host, service | `node` read |
+| `/v1/client/stats` | node_host | `node` read |
 | `/v1/plugins?type=csi` | overview | `plugin` read |
 | `/v1/client/allocation/:id/exec` (websocket) | alloc_exec | namespace `alloc-exec` |
 | `/v1/allocation/:id/stop` (POST) | job_restart | namespace `alloc-lifecycle` |

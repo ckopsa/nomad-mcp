@@ -207,10 +207,26 @@ NODE_DETAIL = {
                  ReservedResources={"Cpu": {"CpuShares": 400}, "Memory": {"MemoryMB": 1024}},
                  CSINodePlugins={"s3": {"Healthy": False, "HealthDescription": "fingerprint failed"}},
                  HostVolumes={"postgres": {}, "minio-data": {}}, StatusUpdatedAt=int(time.time()) - 60,
+                 Meta={"gc_max_allocs": "200"},
                  Events=[{"Timestamp": "2026-09-20T23:00:00Z", "Subsystem": "Cluster",
                           "Message": "Node heartbeat missed", "Details": None}]),
 }
 del NODE_DETAIL[NODE_A]["Address"]  # The single-node read has no Address field.
+
+MB = 1024 * 1024
+_ROOT_DISK = {"Device": "/dev/nvme0n1p2", "Mountpoint": "/", "Size": 238000 * MB,
+              "Used": 202300 * MB, "Available": 35700 * MB, "UsedPercent": 85.0,
+              "InodesUsedPercent": 12.34}
+HOST_STATS = {
+    "Memory": {"Total": 31785 * MB, "Used": 11785 * MB, "Available": 20000 * MB, "Free": 1000 * MB},
+    "Uptime": 3 * 86400 + 4 * 3600 + 5 * 60 + 7,
+    "DiskStats": [_ROOT_DISK,
+                  {"Device": "/dev/nvme0n1p1", "Mountpoint": "/boot/firmware", "Size": 512 * MB,
+                   "Used": 100 * MB, "Available": 412 * MB, "UsedPercent": 19.53,
+                   "InodesUsedPercent": 0.0}],
+    "AllocDirStats": dict(_ROOT_DISK, Mountpoint=""),
+    "Timestamp": NOW_NS,
+}
 
 LOG_TEXT = ("partial line that the tail cuts\n"
             + "".join("\x1b[90m2026-09-25T05:27:%02dZ\x1b[0m line %d of the log\n" % (i % 60, i)
@@ -338,6 +354,10 @@ def routes(path, query):
         return 200, [v for v in items if v["Path"].startswith(prefix)]
     if path.startswith("/v1/var/"):
         return 200, {"Path": path[8:], "Items": {"password": "hunter2"}}
+    if path == "/v1/client/stats":
+        if query.get("node_id") != NODE_A:
+            return 500, "Unknown node %s" % query.get("node_id")
+        return 200, HOST_STATS
     if path == "/v1/plugins":
         return 200, [{"ID": "s3", "ControllerRequired": True, "ControllersHealthy": 1,
                       "ControllersExpected": 1, "NodesHealthy": 1, "NodesExpected": 2}]
@@ -347,12 +367,13 @@ def routes(path, query):
 class FakeNomad:
     """Records every request as (method, path, query, token)."""
 
-    def __init__(self, unix_path=None, forbid=()):
+    def __init__(self, unix_path=None, forbid=(), down=()):
         self.requests = []
         self.execs = []  # (alloc, task, argv, stdin) for each exec that ran
         self.stops = []  # (alloc, namespace) for each allocation stop
         self.hung_up = threading.Event()  # set when a sleep exec saw the client close
         self.forbid = tuple(forbid)
+        self.down = tuple(down)  # paths answered as a client the servers cannot reach
         handler = self._handler()
         if unix_path:
             class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -408,6 +429,9 @@ class FakeNomad:
                 path, query = self._record()
                 if any(path.startswith(p) for p in fake.forbid):
                     self._answer(403, "Permission denied")
+                    return
+                if any(path.startswith(p) for p in fake.down):
+                    self._answer(500, "rpc error: no path to node")
                     return
                 if path.endswith("/exec") and self.headers.get("Upgrade", "").lower() == "websocket":
                     self._exec(path, query)
