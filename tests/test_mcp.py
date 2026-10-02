@@ -71,11 +71,12 @@ class TestHttp(TransportCase):
         self.assertEqual(sorted(t["name"] for t in listed), sorted([
             "cluster_overview", "list_jobs", "job_status", "job_versions", "alloc_status",
             "alloc_logs", "list_nodes", "node_status", "list_services", "service",
-            "list_variables", "list_deployments", "evaluation", "alloc_exec"]))
+            "list_variables", "list_deployments", "evaluation", "alloc_exec", "job_restart"]))
         for tool in listed:
             self.assertTrue(tool["description"])
             self.assertEqual(tool["inputSchema"]["type"], "object")
-            self.assertEqual(tool["annotations"]["readOnlyHint"], tool["name"] != "alloc_exec")
+            self.assertEqual(tool["annotations"]["readOnlyHint"],
+                             tool["name"] not in ("alloc_exec", "job_restart"))
         variables = next(t for t in listed if t["name"] == "list_variables")
         self.assertIn("never reads", variables["description"])
 

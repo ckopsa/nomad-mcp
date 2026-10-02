@@ -27,6 +27,13 @@ class TestSettings(unittest.TestCase):
         self.assertIsNone(client.token)
         self.assertEqual(Client.from_env({}).addr, "http://127.0.0.1:4646")
 
+    def test_namespaces_from_env(self):
+        client = Client.from_env({"NOMAD_MCP_NAMESPACES": "default, doors", "NOMAD_NAMESPACE": "apps"})
+        self.assertEqual((client.namespaces, client.namespace), (["default", "doors"], "default"))
+        client = Client.from_env({"NOMAD_NAMESPACE": "apps"})
+        self.assertEqual((client.namespaces, client.namespace), (["apps"], "apps"))
+        self.assertEqual(Client.from_env({}).namespaces, ["default"])
+
     def test_bad_addresses(self):
         for addr in ("ftp://x", "http://", "unix://"):
             with self.assertRaises(ValueError):
@@ -84,19 +91,21 @@ class TestGetOnly(unittest.TestCase):
                  ("node_status", {"node": "orangepi5plus"}), ("list_services", {}),
                  ("service", {"name": "web"}), ("list_variables", {}),
                  ("list_deployments", {"active_only": False}), ("evaluation", {"eval": "e7e7e7"})]
-        # alloc_exec is the one tool that is not a read; test_exec.py holds it.
-        self.assertEqual(sorted(name for name, _ in calls), sorted(set(tools.TOOLS) - {"alloc_exec"}))
+        # alloc_exec and job_restart are not reads; test_exec.py holds them.
+        self.assertEqual(sorted(name for name, _ in calls),
+                         sorted(set(tools.TOOLS) - {"alloc_exec", "job_restart"}))
         for name, args in calls:
             answer, refused = tools.call(client, name, args)
             self.assertFalse(refused, (name, answer))
         self.assertGreater(len(nomad_fake.requests), 30)
         self.assertEqual(nomad_fake.methods(), ["GET"])
 
-    def test_the_client_has_no_way_to_send_another_method(self):
+    def test_the_client_has_one_write_and_no_way_to_send_another_method(self):
         source = inspect.getsource(nomad)
-        # Exactly one request call, and its method is the literal "GET".
-        self.assertEqual(re.findall(r"\.request\(([^,]+),", source), ['"GET"'])
-        self.assertNotRegex(source, r"\b(POST|PUT|DELETE|PATCH)\b")
+        # Exactly two request calls: the literal "GET", and the literal "POST" of stop_alloc.
+        self.assertEqual(sorted(re.findall(r"\.request\(([^,]+),", source)), ['"GET"', '"POST"'])
+        self.assertNotRegex(source, r"\b(PUT|DELETE|PATCH)\b")
+        self.assertEqual(list(inspect.signature(Client.stop_alloc).parameters), ["self", "alloc_id"])
         for name in ("post", "put", "delete", "patch", "request", "put_raw"):
             self.assertFalse(hasattr(Client, name), name)
         for parameter in ("method", "body", "data"):

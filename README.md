@@ -1,10 +1,12 @@
 # nomad-mcp
 
 A small MCP server for troubleshooting a HashiCorp Nomad cluster. It is
-**read-only but for one tool**: every read goes through a client that sends
-nothing but `GET` (the one line that writes a request hard-codes the method,
-and the tests fail if that changes). The exception is `alloc_exec`, which runs
-one command inside an allocation of a job on an allow-list (below). Changes to
+**read-only but for two tools**: every read goes through a client that sends
+nothing but `GET` (the lines that write a request hard-code the method, and
+the tests fail if that changes). The exceptions are `alloc_exec`, which runs
+one command inside an allocation of a job on an allow-list, and `job_restart`,
+which stops the running allocations of a job on another allow-list through the
+client's one `POST` (below). Changes to
 the cluster go through commits to
 [ckopsa/home-infrastructure](https://github.com/ckopsa/home-infrastructure),
 which CI plans and applies on merge.
@@ -32,11 +34,13 @@ The same environment the `nomad` CLI reads:
 | --- | --- |
 | `NOMAD_ADDR` | `http://…`, `https://…`, or `unix:///path/to/api.sock` |
 | `NOMAD_TOKEN` | sent as `X-Nomad-Token` |
-| `NOMAD_NAMESPACE` | the namespace to read; `default` when unset |
+| `NOMAD_NAMESPACE` | the namespace to read when `NOMAD_MCP_NAMESPACES` is unset; `default` when unset |
+| `NOMAD_MCP_NAMESPACES` | the namespaces a tool may name, comma-separated; the first is the default. Unset, the one of `NOMAD_NAMESPACE` |
 | `NOMAD_CACERT` | a CA bundle for an https address (optional) |
 | `NOMAD_MCP_HOST` | the address `--http` listens on; `127.0.0.1` when unset |
 | `NOMAD_MCP_URL` | where `call` sends; `http://127.0.0.1:8111/mcp/` when unset |
 | `NOMAD_MCP_EXEC_JOBS` | the jobs `alloc_exec` may reach, comma-separated; empty or unset refuses every call |
+| `NOMAD_MCP_RESTART_JOBS` | the jobs `job_restart` may restart, comma-separated `namespace/job` entries (e.g. `doors/clone-mcp`); empty or unset refuses every call |
 
 In production the server runs as a Nomad task and talks to the **Task API**:
 the task's `identity { env = true }` puts its workload identity in
@@ -50,6 +54,12 @@ log tails are capped, times read `2026-09-20 23:05:10Z (4d ago)`. Allocation,
 node and evaluation ids may be given as prefixes (a node also by name); a prefix
 that matches more than one is refused with the candidates listed.
 
+Every tool that names a job or an allocation takes an optional `namespace`,
+one of `NOMAD_MCP_NAMESPACES`; another is refused (`namespace_not_allowed`)
+before Nomad is asked anything. Left out, it is the first listed, an id prefix
+is looked up in every listed namespace, and `list_jobs` lists them all and names
+each job's namespace.
+
 | Tool | What it answers |
 | --- | --- |
 | `cluster_overview` | Start here. Leader, nodes, jobs not running as they should (a dead job parked at `count = 0` is listed apart), allocations stuck, failures of the last 24 h, deployments in motion or failed today, blocked evaluations with reasons, CSI plugin health. |
@@ -59,6 +69,7 @@ that matches more than one is refused with the candidates listed.
 | `alloc_status` | One allocation: statuses and descriptions, each task's state, restarts and last events (exit codes, driver errors), resources, ports. |
 | `alloc_logs` | The tail of a task's stderr or stdout, 8000 bytes by default, 64000 at most. |
 | `alloc_exec` | Runs one command (an argv, no shell, no TTY, optional stdin) in the job's newest running allocation or a named one of it, and gives the exit code, stdout and stderr, each capped at 64 KB with the tail kept. The timeout is 60 s by default and 300 s at most; past it the exec is closed, which ends the command, and the answer says so. A job not in `NOMAD_MCP_EXEC_JOBS` is refused (`job_not_allowed`) before Nomad is asked anything; an allocation of another job is refused (`alloc_not_in_job`). Each call is logged on stderr (job, alloc, task, argv, why, exit code), never its stdin or output. `why` is optional, because a gate in front of this server may hold the why itself and strip it before forwarding; without one the log writes `why=null`. |
+| `job_restart` | Stops each running allocation of a job (`POST /v1/allocation/:id/stop`), so the scheduler places fresh ones: a fresh allocation pulls its image again and re-renders its templates, which an in-place task restart may not. It answers at once with `{job, namespace, stopped, evals}` and never waits for the new allocations; `job_status` follows them. A job whose `namespace/job` is not in `NOMAD_MCP_RESTART_JOBS` is refused (`job_not_allowed`) before Nomad is asked anything. Each call is logged on stderr (job, namespace, allocs, why); `why` is optional, as for `alloc_exec`. |
 | `list_nodes`, `node_status` | Nodes; one node's attributes, driver and CSI health, capacity against allocations, drain, events. |
 | `list_services`, `service` | Nomad native services (with Traefik `Host()` rules); one service's registrations. |
 | `list_variables` | Variable paths and modify times. **Never values.** |
@@ -84,6 +95,7 @@ Every endpoint the server reads, and the capability it needs:
 | `/v1/nodes`, `/v1/node/:id`, `/v1/node/:id/allocations` | overview, nodes, node_status, service | `node` read |
 | `/v1/plugins?type=csi` | overview | `plugin` read |
 | `/v1/client/allocation/:id/exec` (websocket) | alloc_exec | namespace `alloc-exec` |
+| `/v1/allocation/:id/stop` (POST) | job_restart | namespace `alloc-lifecycle` |
 
 ```hcl
 namespace "default" {
@@ -104,7 +116,10 @@ A section the token may not read shows up in `cluster_overview` under
 `unavailable`; any other tool refuses with the path that was forbidden.
 
 `alloc_exec` also needs `alloc-exec`, which this policy leaves out: a separate
-policy in ckopsa/home-infrastructure grants it.
+policy in ckopsa/home-infrastructure grants it. `job_restart` needs
+`alloc-lifecycle` in each namespace its allow-list names, left out the same
+way. Each namespace in `NOMAD_MCP_NAMESPACES` needs the read capabilities above
+in a `namespace` block of its own.
 
 ## Development
 
