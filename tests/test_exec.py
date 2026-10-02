@@ -1,8 +1,12 @@
-"""The tests of alloc_exec, against the fake Nomad's exec websocket."""
+"""The tests of the two tools that write, alloc_exec against the fake Nomad's
+exec websocket and job_restart against its allocation stop, and of the
+namespaces a call may name."""
 
 import io
 import os
 from unittest import mock
+
+from nomadmcp.nomad import Client
 
 from . import fake
 from .test_tools import ToolCase
@@ -74,3 +78,77 @@ class TestAllocExec(ToolCase):
         self.assertIsNone(answer["exit_code"])
         self.assertIn("ran past 1s", answer["note"])
         self.assertTrue(self.nomad.hung_up.wait(5))
+
+
+class NamespacesCase(ToolCase):
+
+    def setUp(self):
+        ToolCase.setUp(self)
+        self.client = Client(addr=self.nomad.addr, token=fake.TOKEN, timeout=5,
+                             namespaces=["default", "doors"])
+
+
+class TestNamespaces(NamespacesCase):
+
+    def test_a_namespace_not_listed_is_refused_without_a_nomad_call(self):
+        for tool, args in (("job_status", {"job": "web"}), ("list_jobs", {}),
+                           ("alloc_status", {"alloc": "a1b2c3"}), ("job_restart", {"job": "clone-mcp"})):
+            answer = self.refuse(tool, namespace="secret", **args)
+            self.assertEqual(answer, {"refused": "namespace_not_allowed", "namespace": "secret",
+                                      "allowed": ["default", "doors"]})
+        self.assertEqual(self.nomad.requests, [])
+
+    def test_list_jobs_reads_every_listed_namespace(self):
+        answer = self.call("list_jobs")
+        spaces = {j["id"]: j["namespace"] for j in answer["jobs"]}
+        self.assertEqual((spaces["web"], spaces["clone-mcp"]), ("default", "doors"))
+        self.assertEqual(sorted(r[2]["namespace"] for r in self.nomad.requests), ["default", "doors"])
+        answer = self.call("list_jobs", namespace="doors")
+        self.assertEqual([j["id"] for j in answer["jobs"]], ["clone-mcp"])
+
+    def test_a_job_is_read_in_the_namespace_named(self):
+        self.assertEqual(self.call("job_status", job="clone-mcp", namespace="doors")["id"], "clone-mcp")
+        self.assertEqual(self.refuse("job_status", job="clone-mcp")["refused"], "not_found")
+
+    def test_an_alloc_prefix_is_found_in_any_listed_namespace(self):
+        answer = self.call("alloc_status", alloc=fake.ALLOC_CLONE[:8])
+        self.assertEqual((answer["id"], answer["job"]), (fake.ALLOC_CLONE, "clone-mcp"))
+        reads = {r[2]["namespace"] for r in self.nomad.requests
+                 if r[1] == "/v1/allocation/" + fake.ALLOC_CLONE}
+        self.assertEqual(reads, {"doors"})
+
+
+class TestJobRestart(NamespacesCase):
+
+    def setUp(self):
+        NamespacesCase.setUp(self)
+        patcher = mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": "doors/clone-mcp"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_job_not_on_the_list_is_refused_without_a_nomad_call(self):
+        answer = self.refuse("job_restart", job="web", why="a test")
+        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "web", "namespace": "default"})
+        with mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": ""}):
+            answer = self.refuse("job_restart", job="clone-mcp", namespace="doors", why="a test")
+        self.assertEqual(answer["refused"], "job_not_allowed")
+        self.assertEqual(self.nomad.requests, [])
+
+    def test_a_listed_job_in_the_wrong_namespace_is_refused(self):
+        answer = self.refuse("job_restart", job="clone-mcp", why="a test")
+        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "clone-mcp",
+                                  "namespace": "default"})
+        self.assertEqual(self.nomad.requests, [])
+
+    def test_the_running_allocations_are_stopped_and_the_answer_comes_at_once(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+            answer = self.call("job_restart", job="clone-mcp", namespace="doors", why="a new image")
+        self.assertEqual(answer["stopped"], [fake.ALLOC_CLONE[:8], fake.ALLOC_CLONE_B[:8]])
+        self.assertEqual((answer["job"], answer["namespace"], len(answer["evals"])),
+                         ("clone-mcp", "doors", 2))
+        self.assertEqual(self.nomad.stops, [(fake.ALLOC_CLONE, "doors"), (fake.ALLOC_CLONE_B, "doors")])
+        # One read, then the two stops: it never waits for the new allocations.
+        self.assertEqual([r[0] for r in self.nomad.requests], ["GET", "POST", "POST"])
+        self.assertTrue(all(r[3] == fake.TOKEN for r in self.nomad.requests))
+        self.assertIn('restart job=clone-mcp namespace=doors allocs=c10e0000,c10e1111 '
+                      'why="a new image"', log.getvalue())

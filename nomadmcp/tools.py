@@ -12,9 +12,12 @@ read of Nomad (unreachable, 403, 404) is a refusal too. No tool gives a
 stack trace.
 
 Nothing here writes but alloc_exec, which runs one command through
-execws for a job on its allow-list. The client has no method that could.
+execws for a job on its allow-list, and job_restart, which stops the
+running allocations of a job on its own allow-list through the client's
+one write, stop_alloc.
 """
 
+import copy
 import json
 import os
 import re
@@ -187,13 +190,33 @@ def _try(client, path, params=None, notes=None, label=None):
 def log_call(name, args, refused=None):
     """Writes one short line for the call to the standard error."""
     fields = ["tool=%s" % name]
-    for key in ("job", "alloc", "node", "eval", "name", "prefix"):
+    for key in ("namespace", "job", "alloc", "node", "eval", "name", "prefix"):
         value = args.get(key)
         if isinstance(value, str) and value:
             fields.append("%s=%s" % (key, value[:60]))
     if refused:
         fields.append("refused=%s" % refused)
     print("nomad-mcp call " + " ".join(fields), file=sys.stderr)
+
+
+def _namespace(client, args):
+    """The namespace a call names, or None. One the server does not list is
+    refused before Nomad hears a word."""
+    given = _text(args, "namespace")
+    if given is not None and given not in client.namespaces:
+        raise Refusal("namespace_not_allowed", namespace=given, allowed=client.namespaces)
+    return given
+
+
+def _scoped(client, args):
+    """A copy of the client for one call: its requests name the call's
+    namespace, or the first listed. When the call named none, an id prefix
+    is looked up in every listed namespace (see resolve)."""
+    given = _namespace(client, args)
+    scoped = copy.copy(client)
+    scoped.namespace = given or client.namespace
+    scoped.search = [given] if given else list(client.namespaces)
+    return scoped
 
 
 # --------------------------------------------------------------- resolving
@@ -233,7 +256,9 @@ def resolve(client, kind, ident):
         raise Refusal("input", field=field, reason="an id or an id prefix is necessary")
     ident = ident.strip()
     lowered = ident.lower()
-    if UUID.match(lowered):
+    # Where to look: the call's namespace, or every listed one when it named none.
+    search = getattr(client, "search", None) or [client.namespace]
+    if UUID.match(lowered) and (kind == "node" or len(search) == 1):
         return lowered
     path = _KINDS[kind]
     if kind == "node":
@@ -253,7 +278,9 @@ def resolve(client, kind, ident):
             query = query[:-1]
             if query.endswith("-"):
                 query = query[:-1]
-        items = _get(client, path, {"prefix": query}) or []
+        items = []
+        for space in search:
+            items += _get(client, path, {"prefix": query, "namespace": space}) or []
         matches = [item for item in items if item.get("ID", "").startswith(lowered)]
     if not matches:
         raise Refusal("not_found", kind=kind, given=ident)
@@ -263,6 +290,8 @@ def resolve(client, kind, ident):
         if note:
             answer["note"] = note
         raise Refusal("ambiguous", **answer)
+    if len(search) > 1 and matches[0].get("Namespace"):
+        client.namespace = matches[0]["Namespace"]  # This call's copy reads where it was found.
     return matches[0]["ID"]
 
 
@@ -680,15 +709,20 @@ def list_jobs(client, args):
     kind = _text(args, "type", choices=("service", "batch", "system", "sysbatch"))
     children = _bool(args, "include_children", False)
     limit = _int(args, "limit", 200, 1, CEILING_LIST)
-    jobs = _get(client, "/v1/jobs", {"prefix": prefix}) or []
+    given = _namespace(client, args)
+    jobs = []
+    for space in [given] if given else client.namespaces:
+        jobs += [(space, job) for job in
+                 _get(client, "/v1/jobs", {"prefix": prefix, "namespace": space}) or []]
     rows = []
-    for job in jobs:
+    for space, job in jobs:
         if kind and job.get("Type") != kind:
             continue
         if job.get("ParentID") and not children:
             continue
         groups = ((job.get("JobSummary") or {}).get("Summary")) or {}
-        row = {"id": job.get("ID"), "type": job.get("Type"), "status": job.get("Status"),
+        row = {"id": job.get("ID"), "namespace": job.get("Namespace") or space,
+               "type": job.get("Type"), "status": job.get("Status"),
                "priority": job.get("Priority"), "pool": job.get("NodePool"),
                "groups": {name: nonzero(counts) for name, counts in groups.items()}}
         if job.get("Stop"):
@@ -1157,6 +1191,48 @@ def alloc_exec(client, args):
     return dict({"job": job, "alloc": short(alloc_id), "task": task}, **result)
 
 
+def restart_jobs(environ=None):
+    """The jobs job_restart may reach, as namespace/job entries, from
+    NOMAD_MCP_RESTART_JOBS. Empty refuses all."""
+    env = os.environ if environ is None else environ
+    return {e.strip() for e in (env.get("NOMAD_MCP_RESTART_JOBS") or "").split(",") if e.strip()}
+
+
+def job_restart(client, args):
+    """The second tool that changes anything. It stops each running
+    allocation of an allow-listed job, so the scheduler places fresh ones: a
+    fresh allocation pulls its image again and re-renders its templates,
+    which an in-place task restart may not. The allow-list is judged before
+    Nomad hears a word, and the answer comes at once; job_status follows the
+    new allocations."""
+    job = _text(args, "job", required=True)
+    namespace = client.namespace
+    if "%s/%s" % (namespace, job) not in restart_jobs():
+        raise Refusal("job_not_allowed", job=job, namespace=namespace)
+    why = _text(args, "why")
+    running = [a for a in _get(client, "/v1/job/%s/allocations" % _quote(job)) or []
+               if a.get("ClientStatus") == "running"]
+    if not running:
+        raise Refusal("no_running_alloc", job=job, namespace=namespace)
+    stopped, evals = [], []
+
+    def log(tail=""):
+        print("nomad-mcp restart job=%s namespace=%s allocs=%s why=%s%s" % (
+            job, namespace, ",".join(stopped), json.dumps(why)[:300], tail), file=sys.stderr)
+
+    for alloc in running:
+        try:
+            answer = client.stop_alloc(alloc["ID"])
+        except NomadError as exc:
+            log(" refused=nomad")
+            raise Refusal("nomad", reason=exc.reason, status=exc.status or None, stopped=stopped)
+        stopped.append(short(alloc["ID"]))
+        if isinstance(answer, dict) and answer.get("EvalID"):
+            evals.append(answer["EvalID"])
+    log()
+    return {"job": job, "namespace": namespace, "stopped": stopped, "evals": evals}
+
+
 # ------------------------------------------------------------------ specs
 
 
@@ -1273,6 +1349,23 @@ TOOL_SPECS = [
         }, ["job", "command"]),
     },
     {
+        "name": "job_restart",
+        "function": job_restart,
+        "read_only": False,
+        "description": (
+            "Restarts a job on the restart allow-list by stopping each of its running "
+            "allocations, so the scheduler places fresh ones that pull the image again and "
+            "re-render their templates. It answers at once with the allocations stopped and "
+            "the evaluations made, and never waits for the new ones: follow with job_status. "
+            "why is one optional sentence for the log. A job not on the allow-list is refused."
+        ),
+        "schema": _schema({
+            "job": _JOB,
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["job"]),
+    },
+    {
         "name": "list_nodes",
         "function": list_nodes,
         "description": "Lists the client nodes: name, status, eligibility, drain, pool, address, "
@@ -1340,6 +1433,16 @@ TOOL_SPECS = [
 
 TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 
+# The tools that name a job or an allocation read in the namespace the call
+# names. list_jobs takes one too, and reads every listed one without it.
+NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_exec",
+              "job_restart", "list_deployments", "evaluation")
+_NAMESPACE = {"type": "string", "description": (
+    "The Nomad namespace, one of those this server lists. Left out: the first listed, "
+    "and an id prefix is looked up in every listed one; list_jobs lists them all.")}
+for _name in NAMESPACED + ("list_jobs",):
+    TOOLS[_name]["schema"]["properties"]["namespace"] = _NAMESPACE
+
 
 def call(client, name, args):
     """Calls one tool by name. Gives (answer, refused)."""
@@ -1352,7 +1455,8 @@ def call(client, name, args):
         answer = {"refused": "unknown_tool", "tool": name, "known": sorted(TOOLS)}
     else:
         try:
-            answer = spec["function"](client, args)
+            scoped = _scoped(client, args) if name in NAMESPACED else client
+            answer = spec["function"](scoped, args)
             log_call(name, args)
             return answer, False
         except Refusal as exc:

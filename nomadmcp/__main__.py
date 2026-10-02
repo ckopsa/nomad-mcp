@@ -97,7 +97,7 @@ def main(argv=None):
         return 0
     httpd = mcp.serve_http(client, args.http, host=args.host)
     print("nomad-mcp on http://%s:%s/mcp/ reading %s (namespace %s, token %s)"
-          % (args.host, httpd.server_address[1], client.describe(), client.namespace,
+          % (args.host, httpd.server_address[1], client.describe(), ",".join(client.namespaces),
              "set" if client.token else "none"), file=sys.stderr)
     try:
         httpd.serve_forever()

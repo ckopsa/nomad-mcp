@@ -1,4 +1,4 @@
-"""The Nomad HTTP API client. It only ever sends GET.
+"""The Nomad HTTP API client. It sends GET, and one POST.
 
 WHY GET ONLY: this server is for looking. A change to the cluster goes
 through a commit to ckopsa/home-infrastructure, which CI plans on the
@@ -8,6 +8,12 @@ production, so there is no such code path here: the one place that
 talks to the socket hard-codes the method, and no function takes a
 method or a body. The tests hold that line.
 
+THE ONE POST: stop_alloc stops one allocation, so the scheduler places a
+fresh one. It is how job_restart gets a merged image running without a
+person at a terminal, and it is the only write: its method is the one
+literal beside GET, it takes an allocation id and nothing else, and it
+sends no body.
+
 The settings come from the environment, the same names the nomad CLI
 uses, so the server runs anywhere the CLI does:
 
@@ -16,6 +22,8 @@ uses, so the server runs anywhere the CLI does:
   NOMAD_TOKEN      sent as X-Nomad-Token; inside a task it is the
                    workload identity (identity { env = true })
   NOMAD_NAMESPACE  the namespace to read; the default is "default"
+  NOMAD_MCP_NAMESPACES  the namespaces a tool may name, comma-separated;
+                   the first is the default. Unset, NOMAD_NAMESPACE alone
   NOMAD_CACERT     a CA bundle for an https address (optional)
 
 Every failure becomes a NomadError with a short message: a refused
@@ -73,13 +81,18 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Client:
-    """Reads the Nomad API. Its only request method is get."""
+    """Reads the Nomad API with get. stop_alloc is its one write."""
 
     def __init__(self, addr=None, token=None, namespace=None, timeout=DEFAULT_TIMEOUT,
-                 cacert=None):
+                 cacert=None, namespaces=None):
         self.addr = (addr or DEFAULT_ADDR).rstrip("/")
         self.token = token or None
-        self.namespace = namespace or "default"
+        # The namespaces a tool may name; the first is the default. Every
+        # request sends self.namespace, and a tool call reads through a copy
+        # of the client set to the call's own namespace.
+        self.namespaces = ([n.strip() for n in (namespaces or []) if n and n.strip()]
+                           or [namespace or "default"])
+        self.namespace = self.namespaces[0]
         self.timeout = timeout
         self.cacert = cacert or None
         # One keep-alive connection per thread. The overview makes dozens
@@ -109,6 +122,7 @@ class Client:
         return cls(addr=env.get("NOMAD_ADDR") or DEFAULT_ADDR,
                    token=env.get("NOMAD_TOKEN"),
                    namespace=env.get("NOMAD_NAMESPACE"),
+                   namespaces=(env.get("NOMAD_MCP_NAMESPACES") or "").split(","),
                    timeout=float(timeout) if timeout else DEFAULT_TIMEOUT,
                    cacert=env.get("NOMAD_CACERT"))
 
@@ -133,6 +147,20 @@ class Client:
 
     def get_raw(self, path, params=None):
         """GETs one path. Gives the body as bytes. Raises NomadError."""
+        return self._send(path, params, False)
+
+    def stop_alloc(self, alloc_id):
+        """Stops one allocation in the client's namespace, so the scheduler
+        places a fresh one. The one write. Gives Nomad's answer (its EvalID)."""
+        path = "/v1/allocation/%s/stop" % urllib.parse.quote(str(alloc_id), safe="")
+        body = self._send(path, None, True)
+        try:
+            return json.loads(body.decode("utf-8") or "null")
+        except ValueError:
+            raise NomadError("the answer to POST %s is not JSON" % path, path=path)
+
+    def _send(self, path, params, write):
+        verb = "POST" if write else "GET"
         query = {"namespace": self.namespace}
         for key, value in (params or {}).items():
             if value is None:
@@ -145,27 +173,27 @@ class Client:
         if self.token:
             headers["X-Nomad-Token"] = self.token
         try:
-            status, body = self._exchange(target, headers)
+            status, body = self._exchange(target, headers, write)
         except socket.timeout:
             self._drop()
-            raise NomadError("Nomad did not answer GET %s within %ss" % (path, self.timeout),
+            raise NomadError("Nomad did not answer %s %s within %ss" % (verb, path, self.timeout),
                              path=path)
         except (OSError, http.client.HTTPException) as exc:
             self._drop()
             raise NomadError(self._scrub("cannot reach Nomad at %s: %s: %s"
                                          % (self.addr, type(exc).__name__, exc)), path=path)
         if len(body) > MAX_RESPONSE:
-            raise NomadError("the answer to GET %s is larger than %s bytes" % (path, MAX_RESPONSE),
+            raise NomadError("the answer to %s %s is larger than %s bytes" % (verb, path, MAX_RESPONSE),
                              status=status, path=path)
         if status >= 400:
             detail = self._scrub(body[:300].decode("utf-8", "replace").strip())
             if status == 403:
-                reason = ("forbidden: the token may not GET %s (%s). The ACL policy needs "
-                          "the capability for it." % (path, detail or "Permission denied"))
+                reason = ("forbidden: the token may not %s %s (%s). The ACL policy needs "
+                          "the capability for it." % (verb, path, detail or "Permission denied"))
             elif status == 404:
-                reason = "not found: GET %s (%s)" % (path, detail or "404")
+                reason = "not found: %s %s (%s)" % (verb, path, detail or "404")
             else:
-                reason = "Nomad answered %s to GET %s: %s" % (status, path, detail)
+                reason = "Nomad answered %s to %s %s: %s" % (status, verb, path, detail)
             raise NomadError(reason, status=status, path=path)
         return body
 
@@ -175,19 +203,25 @@ class Client:
         if connection is not None:
             connection.close()
 
-    def _exchange(self, target, headers):
-        """One GET on this thread's connection. This is the one function that
-        writes to the network, and the method is written here and nowhere
-        else. A kept-alive connection the agent has closed fails on first
-        use; that one failure is retried on a fresh connection, which is
-        safe because a GET changes nothing."""
+    def _exchange(self, target, headers, write=False):
+        """One request on this thread's connection. This is the one function
+        that writes to the network, and the two methods are written here and
+        nowhere else. A kept-alive connection the agent has closed fails on
+        first use; that one failure is retried on a fresh connection, which
+        is safe because a GET changes nothing. A POST never rides a kept
+        connection, so it is never retried and never sent twice."""
+        if write:
+            self._drop()
         for attempt in (0, 1):
             connection = getattr(self._local, "connection", None)
             reused = connection is not None
             if connection is None:
                 connection = self._local.connection = self._connection()
             try:
-                connection.request("GET", target, headers=headers)
+                if write:
+                    connection.request("POST", target, headers=headers)
+                else:
+                    connection.request("GET", target, headers=headers)
                 response = connection.getresponse()
                 body = response.read(MAX_RESPONSE + 1)
                 if response.will_close or len(body) > MAX_RESPONSE:

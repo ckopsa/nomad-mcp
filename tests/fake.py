@@ -3,7 +3,9 @@
 No test talks to a real cluster. The fake listens on 127.0.0.1 or on a
 unix socket, answers the GET paths the tools read, and records every
 request it sees, method included, so a test can prove that nothing but
-GET ever left the client. Any other method is recorded and answered 405.
+GET ever left the client but the one allocation stop. Any other method or
+path is recorded and answered 405. A second namespace, doors, holds one
+job of its own.
 
 The shapes are trimmed copies of what a Nomad 2.0 agent answers.
 """
@@ -29,6 +31,9 @@ ALLOC_WEB_OLD = "a1b2ffff-0000-0000-0000-000000000002"
 ALLOC_PAIR = "c0ffee00-0000-0000-0000-000000000003"
 ALLOC_BACKUP = "b0b0b0b0-0000-0000-0000-000000000004"
 EVAL_BLOCKED = "e7e7e7e7-0000-0000-0000-000000000005"
+ALLOC_CLONE = "c10e0000-0000-0000-0000-000000000009"
+ALLOC_CLONE_B = "c10e1111-0000-0000-0000-00000000000a"
+ALLOC_CLONE_OLD = "c10e2222-0000-0000-0000-00000000000b"
 NODE_SECRET = "node-secret-id-never-shown"
 
 
@@ -96,7 +101,13 @@ ALLOCS = [
                       DriverError="unauthorized", FailsTask=True)])},
            2 * HOUR_NS, job_type="batch"),
 ]
-for _a in ALLOCS:
+DOORS_ALLOCS = [dict(_alloc(ident, "clone-mcp", "clone", NODE_A, "orangepi5plus", client,
+                            {"server": _state("running" if client == "running" else "dead")}, ago),
+                     Namespace="doors")
+                for ident, client, ago in ((ALLOC_CLONE, "running", HOUR_NS),
+                                           (ALLOC_CLONE_B, "running", 2 * HOUR_NS),
+                                           (ALLOC_CLONE_OLD, "complete", 30 * HOUR_NS))]
+for _a in ALLOCS + DOORS_ALLOCS:
     _a["DesiredStatus"] = "run" if _a["ClientStatus"] != "complete" else "stop"
     _a["AllocatedResources"] = {
         "Tasks": {name: {"Cpu": {"CpuShares": 200}, "Memory": {"MemoryMB": 256, "MemoryMaxMB": 512}}
@@ -114,6 +125,7 @@ JOBS = [
     _job_stub("backup/periodic-1790305200", kind="batch", parent="backup", backup={"Failed": 1}),
 ]
 JOBS[5]["Periodic"] = True
+DOORS_JOBS = [dict(_job_stub("clone-mcp", clone={"Running": 2}), Namespace="doors")]
 
 
 def _job_spec(stub, counts):
@@ -134,6 +146,7 @@ JOB_SPECS = {
     "pair": _job_spec(JOBS[3], {"main": 1}),
     "nfs": _job_spec(JOBS[4], {"nodes": 1}),
 }
+DOORS_SPECS = {"clone-mcp": _job_spec(DOORS_JOBS[0], {"clone": 2})}
 
 EVALS = [
     {"ID": EVAL_BLOCKED, "JobID": "web", "Status": "blocked", "Type": "service", "Priority": 50,
@@ -204,8 +217,38 @@ LOG_TEXT = ("partial line that the tail cuts\n"
                       for i in range(400)))
 
 
+def doors_routes(path, query):
+    """Gives (status, body) for one GET of a namespaced path in doors, or None."""
+    prefix = query.get("prefix", "")
+    if path == "/v1/jobs":
+        return 200, [j for j in DOORS_JOBS if j["ID"].startswith(prefix)]
+    if path == "/v1/allocations":
+        return 200, [a for a in DOORS_ALLOCS if a["ID"].startswith(prefix)]
+    if path.startswith("/v1/allocation/"):
+        found = [a for a in DOORS_ALLOCS if a["ID"] == path.split("/")[3]]
+        return (200, found[0]) if found else (404, "alloc not found")
+    if path.startswith("/v1/job/"):
+        parts = path.split("/")
+        job = urllib.parse.unquote(parts[3])
+        rest = parts[4] if len(parts) > 4 else ""
+        if job not in DOORS_SPECS:
+            return 404, "job not found"
+        if rest == "":
+            return 200, DOORS_SPECS[job]
+        if rest == "allocations":
+            return 200, [a for a in DOORS_ALLOCS if a["JobID"] == job]
+        return 200, None if rest in ("deployment", "summary") else []
+    if path in ("/v1/evaluations", "/v1/deployments"):
+        return 200, []
+    return None
+
+
 def routes(path, query):
     """Gives (status, body) for one GET."""
+    if query.get("namespace") == "doors":
+        answer = doors_routes(path, query)
+        if answer is not None:
+            return answer
     prefix = query.get("prefix", "")
     if prefix and len(prefix.replace("-", "")) % 2 and path in ("/v1/allocations", "/v1/nodes",
                                                                  "/v1/evaluations"):
@@ -307,6 +350,7 @@ class FakeNomad:
     def __init__(self, unix_path=None, forbid=()):
         self.requests = []
         self.execs = []  # (alloc, task, argv, stdin) for each exec that ran
+        self.stops = []  # (alloc, namespace) for each allocation stop
         self.hung_up = threading.Event()  # set when a sleep exec saw the client close
         self.forbid = tuple(forbid)
         handler = self._handler()
@@ -422,7 +466,18 @@ class FakeNomad:
                 self._record()
                 self._answer(405, "method not allowed")
 
-            do_POST = do_PUT = do_DELETE = do_PATCH = _refuse
+            def do_POST(self):
+                """The one write the client may send: an allocation stop."""
+                path, query = self._record()
+                parts = path.split("/")
+                if len(parts) == 5 and parts[1:3] == ["v1", "allocation"] and parts[4] == "stop":
+                    fake.stops.append((parts[3], query.get("namespace")))
+                    self._answer(200, {"EvalID": "e5e5e5e5-0000-0000-0000-%012d" % len(fake.stops),
+                                       "Index": 7})
+                    return
+                self._answer(405, "method not allowed")
+
+            do_PUT = do_DELETE = do_PATCH = _refuse
 
         return Handler
 
