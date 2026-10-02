@@ -1031,6 +1031,116 @@ def node_status(client, args):
     return answer
 
 
+# The client's GC settings live in its agent config, which no API carries.
+# Each is read from node meta of the same name when an operator set one
+# there, and is otherwise Nomad's default, said so.
+GC_DEFAULTS = (("gc_disk_usage_threshold", 80), ("gc_inode_usage_threshold", 70),
+               ("gc_max_allocs", 50), ("gc_interval", "1m"))
+TERMINAL_CLIENT = ("complete", "failed", "lost")
+MB = 1024 * 1024
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _megabytes(value):
+    return int(value) // MB if _number(value) else None
+
+
+def _disk_row(disk):
+    return {"device": disk.get("Device") or None, "mountpoint": disk.get("Mountpoint") or None,
+            "size_mb": _megabytes(disk.get("Size")), "used_mb": _megabytes(disk.get("Used")),
+            "available_mb": _megabytes(disk.get("Available")),
+            "used_percent": round(disk["UsedPercent"], 1) if _number(disk.get("UsedPercent")) else None,
+            "inodes_used_percent": (round(disk["InodesUsedPercent"], 1)
+                                    if _number(disk.get("InodesUsedPercent")) else None)}
+
+
+def _uptime(seconds):
+    if not _number(seconds) or seconds < 0:
+        return None
+    seconds = int(seconds)
+    return "%dd %dh %dm" % (seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60)
+
+
+def _gc_settings(node):
+    """Each GC setting with where its value came from."""
+    meta = node.get("Meta") or {}
+    settings = {}
+    for name, default in GC_DEFAULTS:
+        given = meta.get(name)
+        if given in (None, ""):
+            settings[name] = {"value": default, "from": "nomad default"}
+            continue
+        if _number(default):
+            try:
+                given = float(given)
+                given = int(given) if given.is_integer() else given
+            except (TypeError, ValueError):
+                pass
+        settings[name] = {"value": given, "from": "node meta"}
+    return settings
+
+
+def node_host(client, args):
+    node_id = resolve(client, "node", args.get("node"))
+    node = _get(client, "/v1/node/%s" % node_id)
+    # Built from an allow-list, as node_status is: the node carries its SecretID.
+    answer = {"name": node.get("Name"), "id": node.get("ID"), "status": node.get("Status")}
+    unreadable = []
+    stats = _try(client, "/v1/client/stats", {"node_id": node_id}, unreadable, "client stats")
+    if isinstance(stats, dict):
+        answer["disks"] = [_disk_row(d or {}) for d in stats.get("DiskStats") or []]
+        answer["alloc_dir"] = _disk_row(stats["AllocDirStats"]) if stats.get("AllocDirStats") else None
+        memory = stats.get("Memory") or {}
+        answer["memory"] = {"total_mb": _megabytes(memory.get("Total")),
+                            "used_mb": _megabytes(memory.get("Used")),
+                            "available_mb": _megabytes(memory.get("Available"))}
+        answer["uptime"] = _uptime(stats.get("Uptime"))
+    else:
+        answer.update(disks=None, alloc_dir=None, memory=None, uptime=None)
+    gc = answer["gc"] = _gc_settings(node)
+    defaulted = [name for name, _ in GC_DEFAULTS if gc[name]["from"] == "nomad default"]
+    if defaulted:
+        unreadable.append("%s: the client's agent config is in no API, so Nomad's defaults "
+                          "are shown; node meta of the same name would show the real value"
+                          % ", ".join(defaulted))
+    allocs = _try(client, "/v1/node/%s/allocations" % node_id, notes=unreadable, label="allocations")
+    counts = None
+    if allocs is not None:
+        counts = {"running": 0, "pending": 0, "terminal": 0}
+        for alloc in allocs:
+            status = alloc.get("ClientStatus")
+            if status in TERMINAL_CLIENT:
+                counts["terminal"] += 1
+            elif status in counts:
+                counts[status] += 1
+        counts["gc_max_allocs"] = gc["gc_max_allocs"]["value"]
+    answer["allocations"] = counts
+    # What makes the client collect terminal allocations at once, their
+    # logs and files with them: the alloc dir's disk past a threshold, or
+    # more allocations than gc_max_allocs.
+    pressure = []
+    alloc_dir = answer["alloc_dir"] or {}
+    for field, name in (("used_percent", "gc_disk_usage_threshold"),
+                        ("inodes_used_percent", "gc_inode_usage_threshold")):
+        value, limit = alloc_dir.get(field), gc[name]["value"]
+        if _number(value) and _number(limit) and value > limit:
+            pressure.append("alloc dir %s %s%% is past %s %s" % (
+                "disk" if field == "used_percent" else "inodes", value, name, limit))
+    limit = gc["gc_max_allocs"]["value"]
+    if counts and _number(limit):
+        held = counts["running"] + counts["pending"] + counts["terminal"]
+        if held >= limit:
+            pressure.append("%s allocations held, gc_max_allocs is %s" % (held, limit))
+    if pressure:
+        answer["gc_pressure"] = pressure
+    if unreadable:
+        answer["unreadable"] = unreadable
+    return answer
+
+
 _HOST_RULE = re.compile(r"Host\(`([^`]+)`\)")
 
 
@@ -1382,6 +1492,20 @@ TOOL_SPECS = [
         ),
         "schema": _schema({"node": {"type": "string", "description": "The node name, id, or id prefix."},
                            "events": _EVENTS}, ["node"]),
+    },
+    {
+        "name": "node_host",
+        "function": node_host,
+        "description": (
+            "One node's host as its client sees it: each host disk's device, mountpoint, size, "
+            "use and inode use, the alloc dir's disk, memory and uptime; the client's GC "
+            "settings (from node meta, else Nomad's defaults, said so); and the allocations it "
+            "holds, running and terminal, beside gc_max_allocs. gc_pressure names what makes the "
+            "client collect dead allocations at once. Use it when an allocation's logs or files "
+            "are gone soon after it ended."
+        ),
+        "schema": _schema({"node": {"type": "string", "description": "The node name, id, or id prefix."}},
+                          ["node"]),
     },
     {
         "name": "list_services",

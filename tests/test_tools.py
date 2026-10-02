@@ -12,9 +12,10 @@ from . import fake
 class ToolCase(unittest.TestCase):
 
     forbid = ()
+    down = ()
 
     def setUp(self):
-        self.nomad = fake.FakeNomad(forbid=self.forbid)
+        self.nomad = fake.FakeNomad(forbid=self.forbid, down=self.down)
         self.addCleanup(self.nomad.close)
         self.client = Client(addr=self.nomad.addr, token=fake.TOKEN, timeout=5)
 
@@ -184,6 +185,28 @@ class TestNodesAndTheRest(ToolCase):
         self.assertNotIn(fake.NODE_SECRET, json.dumps(answer))
         self.assertEqual(self.call("node_status", node="0e19")["name"], "orangepi5plus")
 
+    def test_node_host_gives_disk_use_against_the_gc_settings(self):
+        answer = self.call("node_host", node="orangepi5plus")
+        self.assertEqual(answer["id"], fake.NODE_A)
+        self.assertEqual(answer["disks"][0], {
+            "device": "/dev/nvme0n1p2", "mountpoint": "/", "size_mb": 238000, "used_mb": 202300,
+            "available_mb": 35700, "used_percent": 85.0, "inodes_used_percent": 12.3})
+        self.assertEqual(answer["disks"][1]["mountpoint"], "/boot/firmware")
+        self.assertIsNone(answer["alloc_dir"]["mountpoint"])
+        self.assertEqual(answer["memory"], {"total_mb": 31785, "used_mb": 11785, "available_mb": 20000})
+        self.assertEqual(answer["uptime"], "3d 4h 5m")
+        self.assertEqual(answer["gc"]["gc_max_allocs"], {"value": 200, "from": "node meta"})
+        self.assertEqual(answer["gc"]["gc_disk_usage_threshold"], {"value": 80, "from": "nomad default"})
+        # web running; its old allocation complete and the backup failed are terminal.
+        self.assertEqual(answer["allocations"],
+                         {"running": 1, "pending": 0, "terminal": 2, "gc_max_allocs": 200})
+        self.assertEqual(answer["gc_pressure"], ["alloc dir disk 85.0% is past gc_disk_usage_threshold 80"])
+        self.assertIn("gc_disk_usage_threshold", answer["unreadable"][0])
+        self.assertNotIn("gc_max_allocs", answer["unreadable"][0])
+        self.assertNotIn(fake.NODE_SECRET, json.dumps(answer))
+        stats = [q for m, p, q, t in self.nomad.requests if p == "/v1/client/stats"]
+        self.assertEqual(stats[0]["node_id"], fake.NODE_A)
+
     def test_list_nodes(self):
         answer = self.call("list_nodes")
         self.assertEqual(answer["count"], 2)
@@ -227,6 +250,21 @@ class TestNodesAndTheRest(ToolCase):
         self.assertEqual(answer["refused"], "unknown_tool")
         answer, refused = tools.call(self.client, "list_jobs", ["not", "an", "object"])
         self.assertTrue(refused)
+
+
+class TestUnreachableClient(ToolCase):
+    """A client the servers cannot reach is named in the answer, not a crash."""
+
+    down = ("/v1/client/stats",)
+
+    def test_node_host_names_what_it_cannot_read(self):
+        answer = self.call("node_host", node="orangepi5plus")
+        self.assertIsNone(answer["disks"])
+        self.assertIsNone(answer["alloc_dir"])
+        self.assertNotIn("gc_pressure", answer)
+        self.assertTrue(answer["unreadable"][0].startswith("client stats: Nomad answered 500"))
+        self.assertIn("no path to node", answer["unreadable"][0])
+        self.assertEqual(answer["allocations"]["running"], 1)
 
 
 class TestForbidden(ToolCase):
