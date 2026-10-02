@@ -3,6 +3,7 @@ exec websocket and job_restart against its allocation stop, and of the
 namespaces a call may name."""
 
 import io
+import json
 import os
 from unittest import mock
 
@@ -152,3 +153,25 @@ class TestJobRestart(NamespacesCase):
         self.assertTrue(all(r[3] == fake.TOKEN for r in self.nomad.requests))
         self.assertIn('restart job=clone-mcp namespace=doors allocs=c10e0000,c10e1111 '
                       'why="a new image"', log.getvalue())
+
+    def test_a_dead_job_not_stopped_is_registered_again_with_its_own_spec(self):
+        with mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": "default/broken"}), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+            answer = self.call("job_restart", job="broken", why="the runners are gone")
+        self.assertEqual(answer, {"job": "broken", "namespace": "default", "revived": True,
+                                  "eval": "e6e6e6e6-0000-0000-0000-000000000001"})
+        spec = json.dumps(fake.JOB_SPECS["broken"]).encode("utf-8")
+        self.assertEqual(self.nomad.registers, [(b'{"Job":' + spec + b"}", "default")])
+        self.assertEqual(self.nomad.stops, [])
+        self.assertEqual(self.nomad.requests[-1][:2], ("POST", "/v1/jobs"))
+        self.assertIn('restart job=broken namespace=default allocs= why="the runners are gone" '
+                      'revived=true', log.getvalue())
+
+    def test_a_job_stopped_on_purpose_is_refused(self):
+        with mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": "default/parked"}), \
+                mock.patch.dict(fake.JOB_SPECS["parked"], {"Stop": True}):
+            answer = self.refuse("job_restart", job="parked", why="a test")
+        self.assertEqual(answer, {"refused": "stopped_on_purpose", "job": "parked",
+                                  "namespace": "default"})
+        self.assertEqual(self.nomad.methods(), ["GET"])
+        self.assertEqual(self.nomad.registers, [])

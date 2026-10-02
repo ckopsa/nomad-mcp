@@ -1312,9 +1312,11 @@ def job_restart(client, args):
     """The second tool that changes anything. It stops each running
     allocation of an allow-listed job, so the scheduler places fresh ones: a
     fresh allocation pulls its image again and re-renders its templates,
-    which an in-place task restart may not. The allow-list is judged before
-    Nomad hears a word, and the answer comes at once; job_status follows the
-    new allocations."""
+    which an in-place task restart may not. A job with no running allocation
+    whose status is dead and whose Stop is false is registered again with its
+    own current spec, unchanged; one stopped on purpose is refused. The
+    allow-list is judged before Nomad hears a word, and the answer comes at
+    once; job_status follows the new allocations."""
     job = _text(args, "job", required=True)
     namespace = client.namespace
     if "%s/%s" % (namespace, job) not in restart_jobs():
@@ -1322,13 +1324,26 @@ def job_restart(client, args):
     why = _text(args, "why")
     running = [a for a in _get(client, "/v1/job/%s/allocations" % _quote(job)) or []
                if a.get("ClientStatus") == "running"]
-    if not running:
-        raise Refusal("no_running_alloc", job=job, namespace=namespace)
     stopped, evals = [], []
 
     def log(tail=""):
         print("nomad-mcp restart job=%s namespace=%s allocs=%s why=%s%s" % (
             job, namespace, ",".join(stopped), json.dumps(why)[:300], tail), file=sys.stderr)
+
+    if not running:
+        spec = _get(client, "/v1/job/%s" % _quote(job)) or {}
+        if spec.get("Stop"):
+            raise Refusal("stopped_on_purpose", job=job, namespace=namespace)
+        if spec.get("Status") != "dead":
+            raise Refusal("no_running_alloc", job=job, namespace=namespace)
+        try:
+            answer = client.reregister_job(job)
+        except NomadError as exc:
+            log(" revived=false refused=nomad")
+            raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+        evaluation = answer.get("EvalID") if isinstance(answer, dict) else None
+        log(" revived=true eval=%s" % evaluation)
+        return {"job": job, "namespace": namespace, "revived": True, "eval": evaluation}
 
     for alloc in running:
         try:
@@ -1467,6 +1482,9 @@ TOOL_SPECS = [
             "allocations, so the scheduler places fresh ones that pull the image again and "
             "re-render their templates. It answers at once with the allocations stopped and "
             "the evaluations made, and never waits for the new ones: follow with job_status. "
+            "A dead job with no running allocation that was not stopped on purpose is "
+            "registered again with its own current spec, unchanged, and the answer says "
+            "revived with its evaluation; a job stopped on purpose is refused. "
             "why is one optional sentence for the log. A job not on the allow-list is refused."
         ),
         "schema": _schema({
