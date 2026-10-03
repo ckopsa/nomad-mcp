@@ -23,7 +23,8 @@ MAX_BODY = 1024 * 1024
 INSTRUCTIONS = (
     "This server reads a HashiCorp Nomad cluster: every tool is read-only but alloc_exec, "
     "which runs one command inside an allocation of an allow-listed job, and job_restart, "
-    "which stops an allow-listed job's running allocations so fresh ones start. Start with cluster_overview, then follow what it names: job_status and "
+    "which stops an allow-listed job's running allocations so fresh ones start, and var_put, "
+    "which sets one key of an allow-listed variable from the owner's secret. Start with cluster_overview, then follow what it names: job_status and "
     "job_versions for a job, alloc_status and alloc_logs for an allocation, evaluation for "
     "a placement that failed, node_status for a node. Ids may be given as prefixes. "
     "To change the cluster, edit the ckopsa/home-infrastructure repository (job specs are "
