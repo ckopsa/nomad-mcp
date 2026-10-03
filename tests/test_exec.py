@@ -7,6 +7,7 @@ import json
 import os
 from unittest import mock
 
+from nomadmcp import tools
 from nomadmcp.nomad import Client
 
 from . import fake
@@ -126,20 +127,71 @@ class TestJobRestart(NamespacesCase):
         patcher = mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": "doors/clone-mcp"})
         patcher.start()
         self.addCleanup(patcher.stop)
+        tools._restart_cache.clear()
+        self.addCleanup(tools._restart_cache.clear)
+        self.variable_path = "/v1/var/" + tools.RESTART_VARIABLE
+
+    def put_variable(self, items):
+        patcher = mock.patch.dict(fake.VARIABLES, {tools.RESTART_VARIABLE: {
+            "Namespace": "default", "Path": tools.RESTART_VARIABLE, "Items": items}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_a_job_not_on_the_list_is_refused_without_a_nomad_call(self):
         answer = self.refuse("job_restart", job="web", why="a test")
-        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "web", "namespace": "default"})
+        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "web", "namespace": "default",
+                                  "allowlist": "env"})
         with mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": ""}):
             answer = self.refuse("job_restart", job="clone-mcp", namespace="doors", why="a test")
         self.assertEqual(answer["refused"], "job_not_allowed")
-        self.assertEqual(self.nomad.requests, [])
+        # Nothing but the allow-list's own read, once: the cache holds it.
+        self.assertEqual(self.nomad.paths(), [self.variable_path])
 
     def test_a_listed_job_in_the_wrong_namespace_is_refused(self):
         answer = self.refuse("job_restart", job="clone-mcp", why="a test")
         self.assertEqual(answer, {"refused": "job_not_allowed", "job": "clone-mcp",
-                                  "namespace": "default"})
-        self.assertEqual(self.nomad.requests, [])
+                                  "namespace": "default", "allowlist": "env"})
+        self.assertEqual(self.nomad.paths(), [self.variable_path])
+
+    def test_the_variable_is_used_when_present(self):
+        self.put_variable({"default/broken": "", "jobs": "default/other, doors/thing"})
+        answer = self.call("restart_allowlist")
+        self.assertEqual((answer["source"], answer["jobs"]),
+                         ("variable", ["default/broken", "default/other", "doors/thing"]))
+        self.assertNotIn("variable_unused", answer)
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            answer = self.call("job_restart", job="broken", why="the runners are gone")
+        self.assertEqual((answer["revived"], answer["allowlist"]), (True, "variable"))
+        read = self.nomad.requests[0]
+        self.assertEqual((read[0], read[1], read[2]["namespace"]), ("GET", self.variable_path, "default"))
+
+    def test_the_env_is_used_when_the_variable_is_missing(self):
+        answer = self.call("restart_allowlist")
+        self.assertEqual((answer["source"], answer["jobs"]), ("env", ["doors/clone-mcp"]))
+        self.assertIn("not found", answer["variable_unused"])
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            answer = self.call("job_restart", job="clone-mcp", namespace="doors", why="a test")
+        self.assertEqual(answer["allowlist"], "env")
+
+    def test_a_job_outside_both_lists_is_refused(self):
+        self.put_variable({"default/broken": ""})
+        answer = self.refuse("job_restart", job="web", why="a test")
+        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "web", "namespace": "default",
+                                  "allowlist": "variable"})
+        self.assertEqual(self.nomad.paths(), [self.variable_path])
+        self.assertEqual(self.nomad.stops, [])
+
+    def test_a_change_to_the_variable_is_picked_up_when_the_cache_expires(self):
+        now = [1000.0]
+        with mock.patch.object(tools, "_clock", lambda: now[0]):
+            self.assertEqual(self.call("restart_allowlist")["source"], "env")
+            self.put_variable({"default/github-runner": ""})
+            now[0] += tools.RESTART_CACHE_SECONDS - 1
+            self.assertEqual(self.call("restart_allowlist")["source"], "env")
+            now[0] += 2
+            answer = self.call("restart_allowlist")
+        self.assertEqual((answer["source"], answer["jobs"]), ("variable", ["default/github-runner"]))
+        self.assertEqual(self.nomad.paths(), [self.variable_path, self.variable_path])
 
     def test_the_running_allocations_are_stopped_and_the_answer_comes_at_once(self):
         with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
@@ -148,8 +200,8 @@ class TestJobRestart(NamespacesCase):
         self.assertEqual((answer["job"], answer["namespace"], len(answer["evals"])),
                          ("clone-mcp", "doors", 2))
         self.assertEqual(self.nomad.stops, [(fake.ALLOC_CLONE, "doors"), (fake.ALLOC_CLONE_B, "doors")])
-        # One read, then the two stops: it never waits for the new allocations.
-        self.assertEqual([r[0] for r in self.nomad.requests], ["GET", "POST", "POST"])
+        # The allow-list, one read, then the two stops: it never waits for the new allocations.
+        self.assertEqual([r[0] for r in self.nomad.requests], ["GET", "GET", "POST", "POST"])
         self.assertTrue(all(r[3] == fake.TOKEN for r in self.nomad.requests))
         self.assertIn('restart job=clone-mcp namespace=doors allocs=c10e0000,c10e1111 '
                       'why="a new image"', log.getvalue())
@@ -159,7 +211,7 @@ class TestJobRestart(NamespacesCase):
                 mock.patch("sys.stderr", new_callable=io.StringIO) as log:
             answer = self.call("job_restart", job="broken", why="the runners are gone")
         self.assertEqual(answer, {"job": "broken", "namespace": "default", "revived": True,
-                                  "eval": "e6e6e6e6-0000-0000-0000-000000000001"})
+                                  "eval": "e6e6e6e6-0000-0000-0000-000000000001", "allowlist": "env"})
         spec = json.dumps(fake.JOB_SPECS["broken"]).encode("utf-8")
         self.assertEqual(self.nomad.registers, [(b'{"Job":' + spec + b"}", "default")])
         self.assertEqual(self.nomad.stops, [])

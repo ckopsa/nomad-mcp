@@ -35,6 +35,9 @@ ALLOC_CLONE = "c10e0000-0000-0000-0000-000000000009"
 ALLOC_CLONE_B = "c10e1111-0000-0000-0000-00000000000a"
 ALLOC_CLONE_OLD = "c10e2222-0000-0000-0000-00000000000b"
 NODE_SECRET = "node-secret-id-never-shown"
+# Variables answered by path; a test patches one in. Unset, nomad-mcp's own
+# paths answer 404.
+VARIABLES = {}
 
 
 def _node(ident, name, pool, address):
@@ -352,6 +355,10 @@ def routes(path, query):
                  {"Path": "nomad/jobs/web/deploy", "ModifyTime": NOW_NS, "Namespace": "default"},
                  {"Path": "other/thing", "ModifyTime": NOW_NS, "Namespace": "default"}]
         return 200, [v for v in items if v["Path"].startswith(prefix)]
+    if path[8:] in VARIABLES and path.startswith("/v1/var/"):
+        return 200, VARIABLES[path[8:]]
+    if path.startswith("/v1/var/nomad/jobs/nomad-mcp/"):
+        return 404, "variable not found"
     if path.startswith("/v1/var/"):
         return 200, {"Path": path[8:], "Items": {"password": "hunter2"}}
     if path == "/v1/client/stats":
