@@ -18,6 +18,11 @@ again with its own current spec, which it reads from Nomad itself and
 sends back byte for byte. It takes a job id and nothing else, so nothing
 about a job can be changed through it.
 
+THE THIRD WRITE also rides the POST: put_variable writes one variable's
+items back with check-and-set on the modify index they were read at, for
+var_put, which judges the path against its allow-list first. No error it
+raises carries a value.
+
 The settings come from the environment, the same names the nomad CLI
 uses, so the server runs anywhere the CLI does:
 
@@ -182,6 +187,31 @@ class Client:
             return json.loads(body.decode("utf-8") or "null")
         except ValueError:
             raise NomadError("the answer to POST /v1/jobs is not JSON", path="/v1/jobs")
+
+    def put_variable(self, path, items, modify_index):
+        """Writes one variable's items with check-and-set on the modify index
+        they were read at (0 for a variable that did not exist), so a
+        concurrent write refuses instead of being lost. Nomad takes a POST for
+        an upsert. Gives the new modify index. A 409 answers the variable that
+        won, values and all, so its body is dropped, and every other reason is
+        scrubbed of the values sent."""
+        target = "/v1/var/%s" % urllib.parse.quote(str(path), safe="/")
+        body = json.dumps({"Namespace": self.namespace, "Path": path, "Items": items}).encode("utf-8")
+        try:
+            answer = self._send(target, {"cas": int(modify_index)}, True, body)
+        except NomadError as exc:
+            if exc.status == 409:
+                raise NomadError("conflict: the variable changed since it was read at modify "
+                                 "index %s" % modify_index, status=409, path=target)
+            reason = exc.reason
+            for value in items.values():
+                if value:
+                    reason = reason.replace(str(value), "***")
+            raise NomadError(reason, status=exc.status, path=target)
+        try:
+            return json.loads(answer.decode("utf-8") or "null").get("ModifyIndex")
+        except (ValueError, AttributeError):
+            raise NomadError("the answer to POST %s is not a variable" % target, path=target)
 
     def _send(self, path, params, write, body=None):
         verb = "POST" if write else "GET"

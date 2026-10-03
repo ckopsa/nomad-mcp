@@ -3,7 +3,8 @@
 No test talks to a real cluster. The fake listens on 127.0.0.1 or on a
 unix socket, answers the GET paths the tools read, and records every
 request it sees, method included, so a test can prove that nothing but
-GET ever left the client but an allocation stop or a job register. Any other method or
+GET ever left the client but an allocation stop, a job register or a
+variable put. Any other method or
 path is recorded and answered 405. A second namespace, doors, holds one
 job of its own.
 
@@ -499,8 +500,19 @@ class FakeNomad:
                 self._answer(405, "method not allowed")
 
             def do_POST(self):
-                """The writes the client may send: an allocation stop, a job register."""
+                """The writes the client may send: an allocation stop, a job register,
+                a variable put with check-and-set (409 with the winner, as Nomad)."""
                 path, query = self._record()
+                if path.startswith("/v1/var/"):
+                    sent = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                    name, held = path[8:], VARIABLES.get(path[8:])
+                    index = held.get("ModifyIndex", 0) if held else 0
+                    if "cas" in query and int(query["cas"]) != index:
+                        self._answer(409, held or {})
+                        return
+                    VARIABLES[name] = dict(sent, Path=name, ModifyIndex=index + 1)
+                    self._answer(200, VARIABLES[name])
+                    return
                 if path == "/v1/jobs":
                     body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                     fake.registers.append((body, query.get("namespace")))
