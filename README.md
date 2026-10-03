@@ -1,15 +1,16 @@
 # nomad-mcp
 
 A small MCP server for troubleshooting a HashiCorp Nomad cluster. It is
-**read-only but for three tools**: every read goes through a client that sends
+**read-only but for six tools**: every read goes through a client that sends
 nothing but `GET` (the lines that write a request hard-code the method, and
 the tests fail if that changes). The exceptions are `alloc_exec`, which runs
 one command inside an allocation of a job on an allow-list, and `job_restart`,
 which stops the running allocations of a job on another allow-list, or registers
 a dead one again with its own current spec, `job_revert`, which rolls a job
-on that same allow-list back to an earlier version, and `var_put`, which sets one
-key of a variable on a third allow-list, through the client's `POST`s (below).
-Changes to
+on that same allow-list back to an earlier version, `var_put`, which sets one
+key of a variable on a third allow-list, and `alloc_stop` and `job_stop`,
+which stop one allocation or one job not on a deny list, through the client's
+`POST`s (below). Changes to
 the cluster go through commits to
 [ckopsa/home-infrastructure](https://github.com/ckopsa/home-infrastructure),
 which CI plans and applies on merge.
@@ -79,11 +80,20 @@ each job's namespace.
 | `var_put` | Sets one key of a variable whose `namespace/path` is on its allow-list: the variable `nomad/jobs/nomad-mcp/var_put_paths` in `default` (items `namespace/path`, as keys or comma-separated values, matched exactly), read live and cached 60 s like the restart list, else `NOMAD_MCP_VAR_PUT_PATHS`. It reads the variable, sets the key and writes the items back (`POST /v1/var/:path?cas=<modify index>`), so the other keys stay as they were and a concurrent write refuses (`conflict`); a missing variable is made with `cas=0`. `value` is marked `x-secret-ref` in its schema: the engine puts the owner's secret there and its records keep only the reference. It answers `{path, key, namespace, modify_index}`, **never a value**, and no refusal or log line carries one (a 409's body, which holds the winning values, is dropped). A path off the list is refused (`path_not_allowed`) before Nomad is asked anything but the list. Each call is logged on stderr (namespace, path, key, why); `why` is optional. |
 | `job_revert` | Rolls a job on the restart allow-list back to an earlier `version` with Nomad's revert (`POST /v1/job/:id/revert`), which registers that version's spec as a new version. It reads the job's current version first and sends it as `EnforcePriorVersion`, so a change that lands in between is refused (`version_moved`) instead of overwritten. A target not earlier than the current version is refused (`not_earlier`), one more than 10 versions back too (`too_old`), and a job off the allow-list (`job_not_allowed`), all before Nomad hears a write. It answers at once with `{job, namespace, reverted_to, from, version, eval}`, `version` being the new one. Each call is logged on stderr (job, namespace, from, to, why); `why` is optional, as for `alloc_exec`. |
 | `restart_allowlist` | The entries `job_restart` may restart now and their `source` (`variable` or `env`), with the reason the variable was not used when it was not. |
+| `alloc_stop` | Stops one allocation (`POST /v1/allocation/:id/stop`) and answers `{stopped: "alloc", alloc, job, namespace, type, eval}` at once. It places nothing itself and never registers the job again: a batch allocation ends as Nomad marks it, complete or stopped. An allocation already stopped is refused (`not_running`). |
+| `job_stop` | Stops a job and never purges it: its own current spec (`GET /v1/job/:id`) is posted back to `POST /v1/jobs` with `Stop` set, as Nomad's stop without a purge writes, so the job and its versions stay. `purge` is always false; true is refused. A job already stopped is refused (`already_stopped`). The answer is `{stopped: "job", job, namespace, type, purged: false, allocs, eval}`. |
 | `list_nodes`, `node_status` | Nodes; one node's attributes, driver and CSI health, capacity against allocations, drain, events. |
 | `node_host` | One node's host from its client's stats: each disk's device, mountpoint, size, use and inode use, the alloc dir's disk, memory and uptime; the client's GC thresholds and `gc_max_allocs` (from node meta of the same name, else Nomad's defaults, named as such: no API carries a client's agent config); the allocations it holds, running and terminal; and `gc_pressure`, what makes the client collect dead allocations, logs included, at once. A client the servers cannot reach is named under `unreadable`. |
 | `list_services`, `service` | Nomad native services (with Traefik `Host()` rules); one service's registrations. |
 | `list_variables` | Variable paths and modify times. **Never values.** |
 | `list_deployments`, `evaluation` | Deployments (active by default); one evaluation's placement failures in words. |
+
+`alloc_stop` and `job_stop` refuse a job on the deny list (`traefik`, `nomad-mcp`,
+`postgres-server`, `docker-registry`, `keycloak`, and a periodic or dispatched
+child of one) with `job_denied`; `job_stop` does so before Nomad is asked
+anything. The gate in front of this server holds each call for the owner's tap.
+Each call is logged on stderr (job, namespace, alloc or allocs, why); `why` is
+optional, as for `alloc_exec`.
 
 The job summary's failed and lost counts only grow over a job's life, so
 the overview judges "failing now" from the allocations, not from them.
@@ -108,8 +118,8 @@ Every endpoint the server reads, and the capability it needs:
 | `/v1/client/stats` | node_host | `node` read |
 | `/v1/plugins?type=csi` | overview | `plugin` read |
 | `/v1/client/allocation/:id/exec` (websocket) | alloc_exec | namespace `alloc-exec` |
-| `/v1/allocation/:id/stop` (POST) | job_restart | namespace `alloc-lifecycle` |
-| `/v1/jobs` (POST, the job's own spec) | job_restart, for a dead job | namespace `submit-job` |
+| `/v1/allocation/:id/stop` (POST) | job_restart, alloc_stop | namespace `alloc-lifecycle` |
+| `/v1/jobs` (POST, the job's own spec) | job_restart, for a dead job; job_stop, with `Stop` set | namespace `submit-job` |
 | `/v1/job/:id/revert` (POST) | job_revert | namespace `submit-job` |
 | `/v1/var/nomad/jobs/nomad-mcp/var_put_paths` (`default`) | var_put | namespace `variables` path `read`, on that path alone |
 | `/v1/var/:path` (GET, then POST with `cas`) | var_put | namespace `variables` path `read`, `write`, on each allow-listed path alone |
@@ -139,7 +149,8 @@ policy in ckopsa/home-infrastructure grants it. `job_restart` needs
 `alloc-lifecycle` in each namespace its allow-list names, and `submit-job`
 beside it to register a dead job again or revert one (`job_revert`), left out the same way. `var_put` needs
 `read` and `write` on exactly the variable paths its allow-list names, granted
-there too. Each namespace in `NOMAD_MCP_NAMESPACES` needs the read capabilities above
+there too. `alloc_stop` needs `alloc-lifecycle` and `job_stop` needs `submit-job`
+in each namespace they reach, granted the same way. Each namespace in `NOMAD_MCP_NAMESPACES` needs the read capabilities above
 in a `namespace` block of its own.
 
 ## Development

@@ -14,8 +14,11 @@ stack trace.
 Nothing here writes but alloc_exec, which runs one command through
 execws for a job on its allow-list, and job_restart, which stops the
 running allocations of a job on its own allow-list through the client's
-one write, stop_alloc, and var_put, which sets one key of a variable on a
-third allow-list through put_variable and never answers or logs a value.
+one write, stop_alloc. alloc_stop and job_stop stop one allocation or one
+job not on STOP_DENY, through stop_alloc and stop_job; the gate in front of
+this server holds each for the owner's tap. var_put sets one key of a
+variable on a third allow-list through put_variable and never answers or
+logs a value.
 """
 
 import copy
@@ -1493,6 +1496,78 @@ def job_restart(client, args):
             "allowlist": source}
 
 
+# The jobs alloc_stop and job_stop never stop: the front door, this server
+# itself, and what the rest of the house stands on. A periodic or dispatched
+# child of one (traefik/periodic-...) is refused with it.
+STOP_DENY = ("traefik", "nomad-mcp", "postgres-server", "docker-registry", "keycloak")
+STOPPED_CLIENT = ("complete", "failed", "lost")
+
+
+def _stop_denied(job):
+    return (job or "").split("/")[0] in STOP_DENY
+
+
+def _stop_log(line, tail=""):
+    print("nomad-mcp stop " + line + tail, file=sys.stderr)
+
+
+def alloc_stop(client, args):
+    """Stops one allocation of a job not on STOP_DENY through stop_alloc. It
+    places nothing itself and never registers the job again, so a batch
+    allocation ends as Nomad marks it, complete or stopped. The answer names
+    what stopped and comes at once."""
+    alloc_id = resolve(client, "allocation", args.get("alloc"))
+    why = _text(args, "why")
+    alloc = _get(client, "/v1/allocation/%s" % alloc_id) or {}
+    job, namespace = alloc.get("JobID") or "", client.namespace
+    if _stop_denied(job):
+        raise Refusal("job_denied", job=job, namespace=namespace, alloc=short(alloc_id))
+    if alloc.get("DesiredStatus") == "stop" or alloc.get("ClientStatus") in STOPPED_CLIENT:
+        raise Refusal("not_running", job=job, namespace=namespace, alloc=short(alloc_id),
+                      client_status=alloc.get("ClientStatus"),
+                      desired_status=alloc.get("DesiredStatus"))
+    line = "job=%s namespace=%s alloc=%s why=%s" % (job, namespace, short(alloc_id),
+                                                  json.dumps(why)[:300])
+    try:
+        answer = client.stop_alloc(alloc_id)
+    except NomadError as exc:
+        _stop_log(line, " refused=nomad")
+        raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+    _stop_log(line)
+    return {"stopped": "alloc", "alloc": short(alloc_id), "job": job, "namespace": namespace,
+            "type": alloc.get("JobType"),
+            "eval": answer.get("EvalID") if isinstance(answer, dict) else None}
+
+
+def job_stop(client, args):
+    """Stops one job not on STOP_DENY and never purges it: stop_job registers
+    the job's own current spec again with Stop set. purge true is refused,
+    and the deny list is judged before Nomad hears a word."""
+    job = _text(args, "job", required=True)
+    namespace = client.namespace
+    if _bool(args, "purge", False):
+        raise Refusal("input", field="purge", reason="job_stop never purges a job; leave purge false")
+    if _stop_denied(job):
+        raise Refusal("job_denied", job=job, namespace=namespace)
+    why = _text(args, "why")
+    spec = _job(client, job)
+    if spec.get("Stop"):
+        raise Refusal("already_stopped", job=job, namespace=namespace)
+    running = [short(a.get("ID")) for a in _get(client, "/v1/job/%s/allocations" % _quote(job)) or []
+               if a.get("ClientStatus") == "running"]
+    line = "job=%s namespace=%s allocs=%s why=%s" % (job, namespace, ",".join(running),
+                                                  json.dumps(why)[:300])
+    try:
+        answer = client.stop_job(job)
+    except NomadError as exc:
+        _stop_log(line, " refused=nomad")
+        raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+    _stop_log(line)
+    return {"stopped": "job", "job": job, "namespace": namespace, "type": spec.get("Type"),
+            "purged": False, "allocs": running,
+            "eval": answer.get("EvalID") if isinstance(answer, dict) else None}
+
+
 # var_put's allow-list, read live like the restart list: namespace/path
 # entries (a namespace holds no slash, so the first one ends it), as keys or
 # comma-separated values. A path must match an entry exactly.
@@ -1777,6 +1852,43 @@ TOOL_SPECS = [
         "schema": _schema(),
     },
     {
+        "name": "alloc_stop",
+        "function": alloc_stop,
+        "read_only": False,
+        "description": (
+            "Stops one allocation, held for the owner's tap. It places nothing itself and never "
+            "registers the job again: a batch allocation ends as Nomad marks it, complete or "
+            "stopped. Nomad may replace a service allocation; job_stop keeps a whole job from "
+            "running. An allocation of a job on the deny list (%s) is refused, and so is one "
+            "already stopped. The answer names what stopped. why is one optional sentence for "
+            "the log." % ", ".join(STOP_DENY)
+        ),
+        "schema": _schema({
+            "alloc": _ALLOC,
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["alloc"]),
+    },
+    {
+        "name": "job_stop",
+        "function": job_stop,
+        "read_only": False,
+        "description": (
+            "Stops a job, held for the owner's tap, and never purges it: the job's own current "
+            "spec is registered again with Stop set, so the job and its versions stay. purge is "
+            "always false; true is refused. A job on the deny list (%s) is refused before Nomad "
+            "is asked anything, and so is a job already stopped. The answer names the job, the "
+            "running allocations it stops and the evaluation. why is one optional sentence for "
+            "the log." % ", ".join(STOP_DENY)
+        ),
+        "schema": _schema({
+            "job": _JOB,
+            "purge": {"type": "boolean", "description": "Always false: job_stop never purges. true is refused."},
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["job"]),
+    },
+    {
         "name": "var_put",
         "function": var_put,
         "read_only": False,
@@ -1882,7 +1994,8 @@ TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 # The tools that name a job or an allocation read in the namespace the call
 # names. list_jobs takes one too, and reads every listed one without it.
 NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_history", "alloc_exec",
-              "job_restart", "job_revert", "var_put", "list_deployments", "evaluation")
+              "job_restart", "job_revert", "var_put", "alloc_stop", "job_stop",
+              "list_deployments", "evaluation")
 _NAMESPACE = {"type": "string", "description": (
     "The Nomad namespace, one of those this server lists. Left out: the first listed, "
     "and an id prefix is looked up in every listed one; list_jobs lists them all.")}
