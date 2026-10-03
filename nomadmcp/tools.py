@@ -1419,6 +1419,57 @@ def job_restart(client, args):
             "allowlist": source}
 
 
+# How far back job_revert may reach: a revert is for the version that ran a
+# moment ago, not for digging up an old one.
+REVERT_MAX_BACK = 10
+
+
+def job_revert(client, args):
+    """The third tool that changes anything. It rolls a job on the restart
+    allow-list back to an earlier version through Nomad's own revert, with
+    EnforcePriorVersion set to the version read just before, so a change that
+    lands in between is refused instead of overwritten. A target that is not
+    earlier than the current version, or more than REVERT_MAX_BACK versions
+    back, is refused before Nomad hears a write. The revert registers the
+    version after the one read, which EnforcePriorVersion holds."""
+    job = _text(args, "job", required=True)
+    namespace = client.namespace
+    allowed, source, _ = _restart_allowed(client)
+    if "%s/%s" % (namespace, job) not in allowed:
+        raise Refusal("job_not_allowed", job=job, namespace=namespace, allowlist=source)
+    version = args.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise Refusal("input", field="version", reason="a whole number of 0 or more is necessary")
+    why = _text(args, "why")
+    spec = _get(client, "/v1/job/%s" % _quote(job)) or {}
+    current = spec.get("Version")
+    if isinstance(current, bool) or not isinstance(current, int):
+        raise Refusal("nomad", reason="the job %s has no version" % job)
+    if version >= current:
+        raise Refusal("not_earlier", job=job, namespace=namespace, version=version, current=current)
+    if current - version > REVERT_MAX_BACK:
+        raise Refusal("too_old", job=job, namespace=namespace, version=version, current=current,
+                      oldest=current - REVERT_MAX_BACK)
+
+    def log(tail):
+        print("nomad-mcp revert job=%s namespace=%s from=%s to=%s why=%s%s" % (
+            job, namespace, current, version, json.dumps(why)[:300], tail), file=sys.stderr)
+
+    try:
+        answer = client.revert_job(job, version, current)
+    except NomadError as exc:
+        if "enforcing version" in (exc.reason or ""):
+            log(" refused=version_moved")
+            raise Refusal("version_moved", job=job, namespace=namespace, read=current,
+                          reason=exc.reason)
+        log(" refused=nomad")
+        raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+    evaluation = answer.get("EvalID") if isinstance(answer, dict) else None
+    log(" eval=%s" % evaluation)
+    return {"job": job, "namespace": namespace, "reverted_to": version, "from": current,
+            "version": current + 1, "eval": evaluation, "allowlist": source}
+
+
 # ------------------------------------------------------------------ specs
 
 
@@ -1556,6 +1607,27 @@ TOOL_SPECS = [
         }, ["job"]),
     },
     {
+        "name": "job_revert",
+        "function": job_revert,
+        "read_only": False,
+        "description": (
+            "Rolls a job on the restart allow-list back to an earlier version with Nomad's "
+            "revert, which registers that version's spec as a new version. It enforces the "
+            "version read just before, so a change made in between is refused "
+            "(version_moved), never overwritten. version must be earlier than the current "
+            "one and at most %s back; job_versions lists them. It answers the new version "
+            "and the evaluation at once; follow with job_status. why is one optional "
+            "sentence for the log. A job not on the allow-list is refused." % REVERT_MAX_BACK
+        ),
+        "schema": _schema({
+            "job": _JOB,
+            "version": {"type": "integer", "minimum": 0,
+                        "description": "The earlier version to go back to."},
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["job", "version"]),
+    },
+    {
         "name": "restart_allowlist",
         "function": restart_allowlist,
         "description": (
@@ -1650,7 +1722,7 @@ TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 # The tools that name a job or an allocation read in the namespace the call
 # names. list_jobs takes one too, and reads every listed one without it.
 NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_exec",
-              "job_restart", "list_deployments", "evaluation")
+              "job_restart", "job_revert", "list_deployments", "evaluation")
 _NAMESPACE = {"type": "string", "description": (
     "The Nomad namespace, one of those this server lists. Left out: the first listed, "
     "and an id prefix is looked up in every listed one; list_jobs lists them all.")}
