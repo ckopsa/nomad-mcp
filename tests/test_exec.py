@@ -1,6 +1,6 @@
-"""The tests of the two tools that write, alloc_exec against the fake Nomad's
-exec websocket and job_restart against its allocation stop, and of the
-namespaces a call may name."""
+"""The tests of the tools that write, alloc_exec against the fake Nomad's
+exec websocket, job_restart against its allocation stop and job_revert
+against its revert, and of the namespaces a call may name."""
 
 import io
 import json
@@ -227,3 +227,57 @@ class TestJobRestart(NamespacesCase):
                                   "namespace": "default"})
         self.assertEqual(self.nomad.methods(), ["GET"])
         self.assertEqual(self.nomad.registers, [])
+
+
+class TestJobRevert(NamespacesCase):
+
+    def setUp(self):
+        NamespacesCase.setUp(self)
+        patcher = mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": "doors/clone-mcp, default/broken"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tools._restart_cache.clear()
+        self.addCleanup(tools._restart_cache.clear)
+        patcher = mock.patch("sys.stderr", new_callable=io.StringIO)
+        self.log = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_job_is_reverted_with_the_version_read_enforced(self):
+        answer = self.call("job_revert", job="clone-mcp", namespace="doors", version=2, why="a bad image")
+        self.assertEqual(answer, {"job": "clone-mcp", "namespace": "doors", "reverted_to": 2, "from": 3,
+                                  "version": 4, "eval": "e4e4e4e4-0000-0000-0000-000000000001",
+                                  "allowlist": "env"})
+        self.assertEqual(self.nomad.reverts, [("clone-mcp", {"JobID": "clone-mcp", "JobVersion": 2,
+                                                             "EnforcePriorVersion": 3}, "doors")])
+        self.assertEqual(self.nomad.requests[-1][:2], ("POST", "/v1/job/clone-mcp/revert"))
+        self.assertTrue(all(r[3] == fake.TOKEN for r in self.nomad.requests))
+        self.assertIn('revert job=clone-mcp namespace=doors from=3 to=2 why="a bad image" eval=e4e4e4e4',
+                      self.log.getvalue())
+
+    def test_a_change_since_the_read_is_refused_not_overwritten(self):
+        self.nomad.moved["broken"] = 4
+        answer = self.refuse("job_revert", job="broken", version=2, why="a test")
+        self.assertEqual((answer["refused"], answer["read"]), ("version_moved", 3))
+        self.assertIn("enforcing version 3", answer["reason"])
+        self.assertEqual([r[1]["EnforcePriorVersion"] for r in self.nomad.reverts], [3])
+        self.assertIn("refused=version_moved", self.log.getvalue())
+
+    def test_a_job_not_on_the_list_is_refused_without_a_write(self):
+        answer = self.refuse("job_revert", job="web", version=2, why="a test")
+        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "web", "namespace": "default",
+                                  "allowlist": "env"})
+        answer = self.refuse("job_revert", job="clone-mcp", version=2, why="a test")
+        self.assertEqual(answer["refused"], "job_not_allowed")
+        self.assertEqual(self.nomad.paths(), ["/v1/var/" + tools.RESTART_VARIABLE])
+        self.assertEqual(self.nomad.reverts, [])
+
+    def test_a_version_too_far_back_or_not_earlier_is_refused(self):
+        with mock.patch.dict(fake.JOB_SPECS["broken"], {"Version": 19}):
+            answer = self.refuse("job_revert", job="broken", version=8, why="a test")
+            self.assertEqual((answer["refused"], answer["oldest"]), ("too_old", 9))
+            self.assertEqual(self.refuse("job_revert", job="broken", version=19)["refused"], "not_earlier")
+            self.assertEqual(self.refuse("job_revert", job="broken", version="18")["refused"], "input")
+            self.assertEqual(self.nomad.methods(), ["GET"])
+            answer = self.call("job_revert", job="broken", version=18, why="the image is gone")
+        self.assertEqual((answer["reverted_to"], answer["from"], answer["version"]), (18, 19, 20))
+        self.assertEqual([r[1]["JobVersion"] for r in self.nomad.reverts], [18])
