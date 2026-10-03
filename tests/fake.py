@@ -382,6 +382,7 @@ class FakeNomad:
         self.hung_up = threading.Event()  # set when a sleep exec saw the client close
         self.forbid = tuple(forbid)
         self.down = tuple(down)  # paths answered as a client the servers cannot reach
+        self.stream = b"{}\n"  # the body /v1/event/stream answers, then ends
         handler = self._handler()
         if unix_path:
             class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -440,6 +441,9 @@ class FakeNomad:
                     return
                 if any(path.startswith(p) for p in fake.down):
                     self._answer(500, "rpc error: no path to node")
+                    return
+                if path == "/v1/event/stream":
+                    self._answer(200, fake.stream)
                     return
                 if path.endswith("/exec") and self.headers.get("Upgrade", "").lower() == "websocket":
                     self._exec(path, query)

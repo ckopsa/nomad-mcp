@@ -18,6 +18,10 @@ again with its own current spec, which it reads from Nomad itself and
 sends back byte for byte. It takes a job id and nothing else, so nothing
 about a job can be changed through it.
 
+THE STREAM: events follows /v1/event/stream, a GET too, on a connection
+of its own that stays open; history.py keeps from it what an allocation
+said as it ended.
+
 The settings come from the environment, the same names the nomad CLI
 uses, so the server runs anywhere the CLI does:
 
@@ -48,6 +52,9 @@ DEFAULT_TIMEOUT = 10
 # A cap on any one answer. The largest honest answer is a busy cluster's
 # allocation list; anything past this is a mistake, not data to read.
 MAX_RESPONSE = 32 * 1024 * 1024
+# Nomad sends the event stream a heartbeat every 10 s; a minute of silence
+# is a dead stream.
+STREAM_IDLE = 60
 
 
 class NomadError(Exception):
@@ -230,9 +237,9 @@ class Client:
             connection.close()
 
     def _exchange(self, target, headers, write=False, body=None):
-        """One request on this thread's connection. This is the one function
-        that writes to the network, and the two methods are written here and
-        nowhere else. A kept-alive connection the agent has closed fails on
+        """One request on this thread's connection. This and events are the
+        functions that write to the network, and the two methods are written
+        in _request and nowhere else. A kept-alive connection the agent has closed fails on
         first use; that one failure is retried on a fresh connection, which
         is safe because a GET changes nothing. A POST never rides a kept
         connection, so it is never retried and never sent twice."""
@@ -244,11 +251,7 @@ class Client:
             if connection is None:
                 connection = self._local.connection = self._connection()
             try:
-                if write:
-                    connection.request("POST", target, body=body, headers=headers)
-                else:
-                    connection.request("GET", target, headers=headers)
-                response = connection.getresponse()
+                response = self._request(connection, target, headers, write, body)
                 body = response.read(MAX_RESPONSE + 1)
                 if response.will_close or len(body) > MAX_RESPONSE:
                     self._drop()
@@ -268,3 +271,47 @@ class Client:
             return json.loads(body.decode("utf-8") or "null")
         except ValueError:
             raise NomadError("the answer to GET %s is not JSON" % path, path=path)
+
+    @staticmethod
+    def _request(connection, target, headers, write=False, body=None):
+        """Sends one request and gives the response. The two methods are
+        written here and nowhere else."""
+        if write:
+            connection.request("POST", target, body=body, headers=headers)
+        else:
+            connection.request("GET", target, headers=headers)
+        return connection.getresponse()
+
+    def events(self, topic, index=0, namespace=None):
+        """Follows /v1/event/stream for one topic with a GET on a connection of
+        its own, and yields each batch ({Index, Events}) until the stream ends.
+        Heartbeats are skipped. Raises NomadError."""
+        path = "/v1/event/stream"
+        query = {"namespace": namespace or self.namespace, "topic": topic, "index": index}
+        headers = {"Accept": "application/json", "User-Agent": "nomad-mcp"}
+        if self.token:
+            headers["X-Nomad-Token"] = self.token
+        connection = self._connection()
+        try:
+            response = self._request(connection, path + "?" + urllib.parse.urlencode(query), headers)
+            if response.status >= 400:
+                detail = self._scrub(response.read(300).decode("utf-8", "replace").strip())
+                raise NomadError("Nomad answered %s to GET %s: %s" % (response.status, path, detail),
+                                 status=response.status, path=path)
+            if connection.sock is not None:
+                connection.sock.settimeout(STREAM_IDLE)
+            while True:
+                line = response.readline(MAX_RESPONSE)
+                if not line:
+                    return
+                try:
+                    batch = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if isinstance(batch, dict) and batch.get("Events"):
+                    yield batch
+        except (OSError, http.client.HTTPException) as exc:
+            raise NomadError(self._scrub("the event stream from %s broke: %s: %s"
+                                         % (self.addr, type(exc).__name__, exc)), path=path)
+        finally:
+            connection.close()
