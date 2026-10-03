@@ -1,6 +1,6 @@
-"""The tests of the two tools that write, alloc_exec against the fake Nomad's
-exec websocket and job_restart against its allocation stop, and of the
-namespaces a call may name."""
+"""The tests of the tools that write, alloc_exec against the fake Nomad's
+exec websocket, job_restart against its allocation stop and job_revert
+against its revert, and of the namespaces a call may name."""
 
 import io
 import json
@@ -227,3 +227,143 @@ class TestJobRestart(NamespacesCase):
                                   "namespace": "default"})
         self.assertEqual(self.nomad.methods(), ["GET"])
         self.assertEqual(self.nomad.registers, [])
+
+
+SECRET = "ghp-never-shown-0123456789"
+VAR_PATH = "nomad/jobs/waymark-bench"
+
+
+class TestVarPut(NamespacesCase):
+
+    def setUp(self):
+        NamespacesCase.setUp(self)
+        for patcher in (mock.patch.dict(fake.VARIABLES),
+                        mock.patch.dict(os.environ, {"NOMAD_MCP_VAR_PUT_PATHS": "default/" + VAR_PATH})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        tools._restart_cache.clear()
+        self.addCleanup(tools._restart_cache.clear)
+        fake.VARIABLES[VAR_PATH] = {"Namespace": "default", "Path": VAR_PATH, "ModifyIndex": 41,
+                                    "Items": {"BENCH_GITHUB_TOKEN": "kept-as-it-was"}}
+
+    def put(self, **args):
+        args.setdefault("path", VAR_PATH)
+        args.setdefault("key", "BENCH_SECRETS_TOKEN")
+        args.setdefault("value", SECRET)
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+            answer, refused = tools.call(self.client, "var_put", args)
+        return answer, refused, log.getvalue()
+
+    def test_the_value_is_a_secret_reference(self):
+        value = tools.TOOLS["var_put"]["schema"]["properties"]["value"]
+        self.assertIs(value["x-secret-ref"], True)
+
+    def test_one_key_is_set_and_the_others_kept(self):
+        answer, refused, log = self.put(why="hand over the token")
+        self.assertFalse(refused, answer)
+        self.assertEqual(answer, {"path": VAR_PATH, "key": "BENCH_SECRETS_TOKEN", "namespace": "default",
+                                  "modify_index": 42})
+        self.assertEqual(fake.VARIABLES[VAR_PATH]["Items"],
+                         {"BENCH_GITHUB_TOKEN": "kept-as-it-was", "BENCH_SECRETS_TOKEN": SECRET})
+        put = self.nomad.requests[-1]
+        self.assertEqual((put[0], put[1], put[2]["cas"], put[2]["namespace"]),
+                         ("POST", "/v1/var/" + VAR_PATH, "41", "default"))
+        self.assertEqual(self.nomad.methods(), ["GET", "POST"])
+        self.assertIn('var_put namespace=default path=%s key=BENCH_SECRETS_TOKEN '
+                      'why="hand over the token" modify_index=42' % VAR_PATH, log)
+        self.assertNotIn(SECRET, json.dumps(answer) + log)
+        self.assertNotIn("kept-as-it-was", json.dumps(answer) + log)
+
+    def test_a_new_variable_is_made_with_cas_zero(self):
+        with mock.patch.dict(os.environ, {"NOMAD_MCP_VAR_PUT_PATHS": "default/nomad/jobs/nomad-mcp/new"}):
+            answer, refused, _ = self.put(path="nomad/jobs/nomad-mcp/new")
+        self.assertFalse(refused, answer)
+        self.assertEqual(answer["modify_index"], 1)
+        self.assertEqual(self.nomad.requests[-1][2]["cas"], "0")
+
+    def test_a_stale_modify_index_refuses(self):
+        real = self.client.put_variable
+
+        def racing(*args):
+            fake.VARIABLES[VAR_PATH] = dict(fake.VARIABLES[VAR_PATH], ModifyIndex=50,
+                                            Items={"BENCH_GITHUB_TOKEN": "rotated-meanwhile"})
+            return real(*args)
+
+        self.client.put_variable = racing
+        answer, refused, log = self.put()
+        self.assertTrue(refused)
+        self.assertEqual((answer["refused"], answer["status"]), ("conflict", 409))
+        self.assertEqual(fake.VARIABLES[VAR_PATH]["Items"], {"BENCH_GITHUB_TOKEN": "rotated-meanwhile"})
+        for text in (SECRET, "rotated-meanwhile", "kept-as-it-was"):
+            self.assertNotIn(text, json.dumps(answer) + log)
+
+    def test_a_path_outside_the_list_is_refused_before_any_read(self):
+        answer, refused, _ = self.put(path="nomad/jobs/web")
+        self.assertTrue(refused)
+        self.assertEqual(answer, {"refused": "path_not_allowed", "path": "nomad/jobs/web",
+                                  "namespace": "default", "allowlist": "env"})
+        answer, refused, _ = self.put(namespace="doors")
+        self.assertEqual(answer["refused"], "path_not_allowed")
+        self.assertEqual(self.nomad.paths(), ["/v1/var/" + tools.VAR_PUT_VARIABLE])
+        self.assertNotIn(SECRET, json.dumps(answer))
+
+    def test_the_variable_list_is_used_when_present(self):
+        fake.VARIABLES[tools.VAR_PUT_VARIABLE] = {"Items": {"paths": "default/nomad/jobs/clone-mcp"}}
+        answer, refused, _ = self.put()
+        self.assertEqual((answer["refused"], answer["allowlist"]), ("path_not_allowed", "variable"))
+        answer, refused, _ = self.put(path="nomad/jobs/clone-mcp")
+        self.assertFalse(refused, answer)
+
+
+class TestJobRevert(NamespacesCase):
+
+    def setUp(self):
+        NamespacesCase.setUp(self)
+        patcher = mock.patch.dict(os.environ, {"NOMAD_MCP_RESTART_JOBS": "doors/clone-mcp, default/broken"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tools._restart_cache.clear()
+        self.addCleanup(tools._restart_cache.clear)
+        patcher = mock.patch("sys.stderr", new_callable=io.StringIO)
+        self.log = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_job_is_reverted_with_the_version_read_enforced(self):
+        answer = self.call("job_revert", job="clone-mcp", namespace="doors", version=2, why="a bad image")
+        self.assertEqual(answer, {"job": "clone-mcp", "namespace": "doors", "reverted_to": 2, "from": 3,
+                                  "version": 4, "eval": "e4e4e4e4-0000-0000-0000-000000000001",
+                                  "allowlist": "env"})
+        self.assertEqual(self.nomad.reverts, [("clone-mcp", {"JobID": "clone-mcp", "JobVersion": 2,
+                                                             "EnforcePriorVersion": 3}, "doors")])
+        self.assertEqual(self.nomad.requests[-1][:2], ("POST", "/v1/job/clone-mcp/revert"))
+        self.assertTrue(all(r[3] == fake.TOKEN for r in self.nomad.requests))
+        self.assertIn('revert job=clone-mcp namespace=doors from=3 to=2 why="a bad image" eval=e4e4e4e4',
+                      self.log.getvalue())
+
+    def test_a_change_since_the_read_is_refused_not_overwritten(self):
+        self.nomad.moved["broken"] = 4
+        answer = self.refuse("job_revert", job="broken", version=2, why="a test")
+        self.assertEqual((answer["refused"], answer["read"]), ("version_moved", 3))
+        self.assertIn("enforcing version 3", answer["reason"])
+        self.assertEqual([r[1]["EnforcePriorVersion"] for r in self.nomad.reverts], [3])
+        self.assertIn("refused=version_moved", self.log.getvalue())
+
+    def test_a_job_not_on_the_list_is_refused_without_a_write(self):
+        answer = self.refuse("job_revert", job="web", version=2, why="a test")
+        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "web", "namespace": "default",
+                                  "allowlist": "env"})
+        answer = self.refuse("job_revert", job="clone-mcp", version=2, why="a test")
+        self.assertEqual(answer["refused"], "job_not_allowed")
+        self.assertEqual(self.nomad.paths(), ["/v1/var/" + tools.RESTART_VARIABLE])
+        self.assertEqual(self.nomad.reverts, [])
+
+    def test_a_version_too_far_back_or_not_earlier_is_refused(self):
+        with mock.patch.dict(fake.JOB_SPECS["broken"], {"Version": 19}):
+            answer = self.refuse("job_revert", job="broken", version=8, why="a test")
+            self.assertEqual((answer["refused"], answer["oldest"]), ("too_old", 9))
+            self.assertEqual(self.refuse("job_revert", job="broken", version=19)["refused"], "not_earlier")
+            self.assertEqual(self.refuse("job_revert", job="broken", version="18")["refused"], "input")
+            self.assertEqual(self.nomad.methods(), ["GET"])
+            answer = self.call("job_revert", job="broken", version=18, why="the image is gone")
+        self.assertEqual((answer["reverted_to"], answer["from"], answer["version"]), (18, 19, 20))
+        self.assertEqual([r[1]["JobVersion"] for r in self.nomad.reverts], [18])

@@ -94,9 +94,10 @@ class TestGetOnly(unittest.TestCase):
                  ("service", {"name": "web"}), ("list_variables", {}),
                  ("list_deployments", {"active_only": False}), ("evaluation", {"eval": "e7e7e7"}),
                  ("restart_allowlist", {})]
-        # alloc_exec and job_restart are not reads; test_exec.py holds them.
+        # alloc_exec, job_restart, job_revert and var_put are not reads; test_exec.py holds them.
         self.assertEqual(sorted(name for name, _ in calls),
-                         sorted(set(tools.TOOLS) - {"alloc_exec", "job_restart"}))
+                         sorted(set(tools.TOOLS) - {"alloc_exec", "job_restart", "job_revert",
+                                                    "var_put"}))
         for name, args in calls:
             answer, refused = tools.call(client, name, args)
             self.assertFalse(refused, (name, answer))
