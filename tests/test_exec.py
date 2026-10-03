@@ -227,3 +227,86 @@ class TestJobRestart(NamespacesCase):
                                   "namespace": "default"})
         self.assertEqual(self.nomad.methods(), ["GET"])
         self.assertEqual(self.nomad.registers, [])
+
+
+class TestStop(ToolCase):
+
+    BATCH = "ba7c0000-0000-0000-0000-00000000000c"
+    EDGE = "7aef0000-0000-0000-0000-00000000000d"
+
+    def setUp(self):
+        ToolCase.setUp(self)
+        # A running batch allocation, like a conformance run's, and one of traefik's.
+        batch = dict(fake.ALLOCS[3], ID=self.BATCH, JobID="conformance/periodic-1791000000",
+                     ClientStatus="running", DesiredStatus="run")
+        edge = dict(fake.ALLOCS[0], ID=self.EDGE, JobID="traefik")
+        patcher = mock.patch.object(fake, "ALLOCS", fake.ALLOCS + [batch, edge])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        log = mock.patch("sys.stderr", new_callable=io.StringIO)
+        self.log = log.start()
+        self.addCleanup(log.stop)
+
+    def posts(self):
+        return [r[1] for r in self.nomad.requests if r[0] == "POST"]
+
+    def test_alloc_stop_stops_the_one_allocation(self):
+        answer = self.call("alloc_stop", alloc=fake.ALLOC_WEB[:8], why="it holds the cpu")
+        self.assertEqual(answer, {"stopped": "alloc", "alloc": fake.ALLOC_WEB[:8], "job": "web",
+                                  "namespace": "default", "type": "service",
+                                  "eval": "e5e5e5e5-0000-0000-0000-000000000001"})
+        self.assertEqual(self.nomad.stops, [(fake.ALLOC_WEB, "default")])
+        self.assertEqual(self.posts(), ["/v1/allocation/%s/stop" % fake.ALLOC_WEB])
+        self.assertIn('stop job=web namespace=default alloc=a1b2c3d4 why="it holds the cpu"',
+                      self.log.getvalue())
+
+    def test_a_batch_alloc_is_stopped_and_not_placed_again(self):
+        answer = self.call("alloc_stop", alloc=self.BATCH[:8], why="a render waits")
+        self.assertEqual((answer["stopped"], answer["type"], answer["job"]),
+                         ("alloc", "batch", "conformance/periodic-1791000000"))
+        # One stop and nothing after it: no register, no second stop, no new placement.
+        self.assertEqual(self.posts(), ["/v1/allocation/%s/stop" % self.BATCH])
+        self.assertEqual(self.nomad.registers, [])
+        self.assertEqual(self.nomad.requests[-1][0], "POST")
+
+    def test_an_allocation_already_stopped_is_refused(self):
+        answer = self.refuse("alloc_stop", alloc=fake.ALLOC_WEB_OLD[:8])
+        self.assertEqual((answer["refused"], answer["client_status"]), ("not_running", "complete"))
+        self.assertEqual(self.nomad.methods(), ["GET"])
+
+    def test_the_deny_list_refuses_both(self):
+        answer = self.refuse("alloc_stop", alloc=self.EDGE[:8], why="a test")
+        self.assertEqual(answer, {"refused": "job_denied", "job": "traefik", "namespace": "default",
+                                  "alloc": self.EDGE[:8]})
+        requests = len(self.nomad.requests)
+        for job in tools.STOP_DENY + ("traefik/periodic-1791000000",):
+            answer = self.refuse("job_stop", job=job, why="a test")
+            self.assertEqual(answer, {"refused": "job_denied", "job": job, "namespace": "default"})
+        # job_stop refuses before Nomad hears a word.
+        self.assertEqual(len(self.nomad.requests), requests)
+        self.assertEqual(self.nomad.methods(), ["GET"])
+        self.assertEqual((self.nomad.stops, self.nomad.registers), ([], []))
+
+    def test_job_stop_registers_its_own_spec_stopped_and_never_purges(self):
+        answer = self.call("job_stop", job="web", why="it holds the cpu")
+        self.assertEqual(answer, {"stopped": "job", "job": "web", "namespace": "default",
+                                  "type": "service", "purged": False, "allocs": [fake.ALLOC_WEB[:8]],
+                                  "eval": "e6e6e6e6-0000-0000-0000-000000000001"})
+        body, namespace = self.nomad.registers[0]
+        self.assertEqual(json.loads(body), {"Job": dict(fake.JOB_SPECS["web"], Stop=True)})
+        self.assertEqual((len(self.nomad.registers), namespace), (1, "default"))
+        self.assertEqual(self.posts(), ["/v1/jobs"])
+        self.assertEqual(self.nomad.stops, [])
+        self.assertIn('stop job=web namespace=default allocs=a1b2c3d4 why="it holds the cpu"',
+                      self.log.getvalue())
+
+    def test_purge_is_refused_before_nomad_is_asked(self):
+        answer = self.refuse("job_stop", job="web", purge=True)
+        self.assertEqual((answer["refused"], answer["field"]), ("input", "purge"))
+        self.assertEqual(self.nomad.requests, [])
+
+    def test_a_job_already_stopped_is_refused(self):
+        with mock.patch.dict(fake.JOB_SPECS["parked"], {"Stop": True}):
+            answer = self.refuse("job_stop", job="parked")
+        self.assertEqual(answer, {"refused": "already_stopped", "job": "parked", "namespace": "default"})
+        self.assertEqual(self.nomad.methods(), ["GET"])

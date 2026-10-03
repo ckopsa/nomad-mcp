@@ -1,4 +1,4 @@
-"""The Nomad HTTP API client. It sends GET, and two POSTs.
+"""The Nomad HTTP API client. It sends GET, and three POSTs.
 
 WHY GET ONLY: this server is for looking. A change to the cluster goes
 through a commit to ckopsa/home-infrastructure, which CI plans on the
@@ -17,6 +17,11 @@ THE SECOND WRITE rides the same POST: reregister_job registers a dead job
 again with its own current spec, which it reads from Nomad itself and
 sends back byte for byte. It takes a job id and nothing else, so nothing
 about a job can be changed through it.
+
+THE THIRD WRITE rides it too: stop_job registers a job again with its own
+current spec and Stop set to true, which is what Nomad's stop without a
+purge writes, so the job and its versions stay. It takes a job id and
+nothing else, and nothing here can purge.
 
 The settings come from the environment, the same names the nomad CLI
 uses, so the server runs anywhere the CLI does:
@@ -85,7 +90,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Client:
-    """Reads the Nomad API with get. stop_alloc and reregister_job are its writes."""
+    """Reads the Nomad API with get. stop_alloc, reregister_job and stop_job are its writes."""
 
     def __init__(self, addr=None, token=None, namespace=None, timeout=DEFAULT_TIMEOUT,
                  cacert=None, namespaces=None):
@@ -178,6 +183,25 @@ class Client:
         if stop is not False:
             raise NomadError("the job %s was stopped; it is not registered again" % job_id, path=path)
         body = self._send("/v1/jobs", None, True, b'{"Job":' + spec + b"}")
+        try:
+            return json.loads(body.decode("utf-8") or "null")
+        except ValueError:
+            raise NomadError("the answer to POST /v1/jobs is not JSON", path="/v1/jobs")
+
+    def stop_job(self, job_id):
+        """Stops one job and never purges it: it reads the job's current spec
+        and registers it again with Stop set to true, as Nomad's own stop
+        without a purge does, so the job and its versions stay. Gives Nomad's
+        answer (its EvalID)."""
+        path = "/v1/job/%s" % urllib.parse.quote(str(job_id), safe="")
+        try:
+            spec = json.loads(self.get_raw(path).decode("utf-8"))
+        except ValueError:
+            spec = None
+        if not isinstance(spec, dict):
+            raise NomadError("the answer to GET %s is not a job" % path, path=path)
+        spec["Stop"] = True
+        body = self._send("/v1/jobs", None, True, json.dumps({"Job": spec}).encode("utf-8"))
         try:
             return json.loads(body.decode("utf-8") or "null")
         except ValueError:
