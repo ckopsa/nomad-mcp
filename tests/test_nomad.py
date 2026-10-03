@@ -91,7 +91,8 @@ class TestGetOnly(unittest.TestCase):
                  ("node_status", {"node": "orangepi5plus"}), ("node_host", {"node": "orangepi5plus"}),
                  ("list_services", {}),
                  ("service", {"name": "web"}), ("list_variables", {}),
-                 ("list_deployments", {"active_only": False}), ("evaluation", {"eval": "e7e7e7"})]
+                 ("list_deployments", {"active_only": False}), ("evaluation", {"eval": "e7e7e7"}),
+                 ("restart_allowlist", {})]
         # alloc_exec and job_restart are not reads; test_exec.py holds them.
         self.assertEqual(sorted(name for name, _ in calls),
                          sorted(set(tools.TOOLS) - {"alloc_exec", "job_restart"}))

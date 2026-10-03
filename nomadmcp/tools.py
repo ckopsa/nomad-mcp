@@ -1308,6 +1308,64 @@ def restart_jobs(environ=None):
     return {e.strip() for e in (env.get("NOMAD_MCP_RESTART_JOBS") or "").split(",") if e.strip()}
 
 
+# The live restart allow-list: a Nomad variable, so adding a job never waits
+# on a tofu apply that may run on the very job it would revive. Its items are
+# namespace/job entries, as keys or as comma-separated values. It is the one
+# variable value this server reads.
+RESTART_VARIABLE = "nomad/jobs/nomad-mcp/restart_jobs"
+RESTART_VARIABLE_NAMESPACE = "default"
+RESTART_CACHE_SECONDS = 60
+_restart_cache = {}
+_clock = time.monotonic
+
+
+def _restart_variable(client):
+    """The entries of the restart variable, or None and the reason it could
+    not be read. Either is kept for RESTART_CACHE_SECONDS."""
+    now = _clock()
+    cached = _restart_cache.get("variable")
+    if cached is not None and now - cached[0] < RESTART_CACHE_SECONDS:
+        return cached[1], cached[2]
+    scoped = copy.copy(client)
+    scoped.namespace = RESTART_VARIABLE_NAMESPACE
+    entries, reason = None, None
+    try:
+        variable = scoped.get("/v1/var/%s" % RESTART_VARIABLE)
+    except NomadError as exc:
+        reason = exc.reason
+    else:
+        items = variable.get("Items") if isinstance(variable, dict) else None
+        if isinstance(items, dict):
+            entries = set()
+            for key, value in items.items():
+                for entry in [str(key)] + str(value or "").split(","):
+                    if "/" in entry.strip():
+                        entries.add(entry.strip())
+        else:
+            reason = "the variable has no items"
+    _restart_cache["variable"] = (now, entries, reason)
+    return entries, reason
+
+
+def _restart_allowed(client):
+    """(entries, source, reason): the variable's list when it can be read,
+    else NOMAD_MCP_RESTART_JOBS with the reason the variable was not used."""
+    entries, reason = _restart_variable(client)
+    if entries is not None:
+        return entries, "variable", None
+    return restart_jobs(), "env", reason
+
+
+def restart_allowlist(client, args):
+    entries, source, reason = _restart_allowed(client)
+    answer = {"jobs": sorted(entries), "source": source,
+              "variable": "%s/%s" % (RESTART_VARIABLE_NAMESPACE, RESTART_VARIABLE),
+              "env": "NOMAD_MCP_RESTART_JOBS", "cache_seconds": RESTART_CACHE_SECONDS}
+    if reason:
+        answer["variable_unused"] = reason
+    return answer
+
+
 def job_restart(client, args):
     """The second tool that changes anything. It stops each running
     allocation of an allow-listed job, so the scheduler places fresh ones: a
@@ -1319,8 +1377,9 @@ def job_restart(client, args):
     once; job_status follows the new allocations."""
     job = _text(args, "job", required=True)
     namespace = client.namespace
-    if "%s/%s" % (namespace, job) not in restart_jobs():
-        raise Refusal("job_not_allowed", job=job, namespace=namespace)
+    allowed, source, _ = _restart_allowed(client)
+    if "%s/%s" % (namespace, job) not in allowed:
+        raise Refusal("job_not_allowed", job=job, namespace=namespace, allowlist=source)
     why = _text(args, "why")
     running = [a for a in _get(client, "/v1/job/%s/allocations" % _quote(job)) or []
                if a.get("ClientStatus") == "running"]
@@ -1343,7 +1402,8 @@ def job_restart(client, args):
             raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
         evaluation = answer.get("EvalID") if isinstance(answer, dict) else None
         log(" revived=true eval=%s" % evaluation)
-        return {"job": job, "namespace": namespace, "revived": True, "eval": evaluation}
+        return {"job": job, "namespace": namespace, "revived": True, "eval": evaluation,
+                "allowlist": source}
 
     for alloc in running:
         try:
@@ -1355,7 +1415,8 @@ def job_restart(client, args):
         if isinstance(answer, dict) and answer.get("EvalID"):
             evals.append(answer["EvalID"])
     log()
-    return {"job": job, "namespace": namespace, "stopped": stopped, "evals": evals}
+    return {"job": job, "namespace": namespace, "stopped": stopped, "evals": evals,
+            "allowlist": source}
 
 
 # ------------------------------------------------------------------ specs
@@ -1485,13 +1546,24 @@ TOOL_SPECS = [
             "A dead job with no running allocation that was not stopped on purpose is "
             "registered again with its own current spec, unchanged, and the answer says "
             "revived with its evaluation; a job stopped on purpose is refused. "
-            "why is one optional sentence for the log. A job not on the allow-list is refused."
+            "why is one optional sentence for the log. A job not on the allow-list is refused; "
+            "allowlist in the answer says whether the list came from the Nomad variable or the env."
         ),
         "schema": _schema({
             "job": _JOB,
             "why": {"type": "string", "description": (
                 "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
         }, ["job"]),
+    },
+    {
+        "name": "restart_allowlist",
+        "function": restart_allowlist,
+        "description": (
+            "The namespace/job entries job_restart may restart now, and their source: the Nomad "
+            "variable nomad/jobs/nomad-mcp/restart_jobs when it can be read (cached 60 s), else "
+            "the env NOMAD_MCP_RESTART_JOBS, with the reason the variable was not used."
+        ),
+        "schema": _schema(),
     },
     {
         "name": "list_nodes",
