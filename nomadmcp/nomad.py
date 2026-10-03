@@ -1,4 +1,4 @@
-"""The Nomad HTTP API client. It sends GET, and one POST.
+"""The Nomad HTTP API client. It sends GET, and two POSTs.
 
 WHY GET ONLY: this server is for looking. A change to the cluster goes
 through a commit to ckopsa/home-infrastructure, which CI plans on the
@@ -10,9 +10,13 @@ method or a body. The tests hold that line.
 
 THE ONE POST: stop_alloc stops one allocation, so the scheduler places a
 fresh one. It is how job_restart gets a merged image running without a
-person at a terminal, and it is the only write: its method is the one
-literal beside GET, it takes an allocation id and nothing else, and it
-sends no body.
+person at a terminal: its method is the one literal beside GET, it takes
+an allocation id and nothing else, and it sends no body.
+
+THE SECOND WRITE rides the same POST: reregister_job registers a dead job
+again with its own current spec, which it reads from Nomad itself and
+sends back byte for byte. It takes a job id and nothing else, so nothing
+about a job can be changed through it.
 
 The settings come from the environment, the same names the nomad CLI
 uses, so the server runs anywhere the CLI does:
@@ -81,7 +85,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Client:
-    """Reads the Nomad API with get. stop_alloc is its one write."""
+    """Reads the Nomad API with get. stop_alloc and reregister_job are its writes."""
 
     def __init__(self, addr=None, token=None, namespace=None, timeout=DEFAULT_TIMEOUT,
                  cacert=None, namespaces=None):
@@ -159,7 +163,27 @@ class Client:
         except ValueError:
             raise NomadError("the answer to POST %s is not JSON" % path, path=path)
 
-    def _send(self, path, params, write):
+    def reregister_job(self, job_id):
+        """Registers one job again with its own current spec, so the scheduler
+        places a dead job anew. It reads the spec here and posts it back to
+        /v1/jobs as it came, byte for byte, so nothing about the job changes.
+        A job whose Stop is not false is never sent. Gives Nomad's answer
+        (its EvalID)."""
+        path = "/v1/job/%s" % urllib.parse.quote(str(job_id), safe="")
+        spec = self.get_raw(path)
+        try:
+            stop = json.loads(spec.decode("utf-8")).get("Stop")
+        except (ValueError, AttributeError):
+            raise NomadError("the answer to GET %s is not a job" % path, path=path)
+        if stop is not False:
+            raise NomadError("the job %s was stopped; it is not registered again" % job_id, path=path)
+        body = self._send("/v1/jobs", None, True, b'{"Job":' + spec + b"}")
+        try:
+            return json.loads(body.decode("utf-8") or "null")
+        except ValueError:
+            raise NomadError("the answer to POST /v1/jobs is not JSON", path="/v1/jobs")
+
+    def _send(self, path, params, write, body=None):
         verb = "POST" if write else "GET"
         query = {"namespace": self.namespace}
         for key, value in (params or {}).items():
@@ -172,8 +196,10 @@ class Client:
         headers = {"Accept": "application/json", "User-Agent": "nomad-mcp"}
         if self.token:
             headers["X-Nomad-Token"] = self.token
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         try:
-            status, body = self._exchange(target, headers, write)
+            status, body = self._exchange(target, headers, write, body)
         except socket.timeout:
             self._drop()
             raise NomadError("Nomad did not answer %s %s within %ss" % (verb, path, self.timeout),
@@ -203,7 +229,7 @@ class Client:
         if connection is not None:
             connection.close()
 
-    def _exchange(self, target, headers, write=False):
+    def _exchange(self, target, headers, write=False, body=None):
         """One request on this thread's connection. This is the one function
         that writes to the network, and the two methods are written here and
         nowhere else. A kept-alive connection the agent has closed fails on
@@ -219,7 +245,7 @@ class Client:
                 connection = self._local.connection = self._connection()
             try:
                 if write:
-                    connection.request("POST", target, headers=headers)
+                    connection.request("POST", target, body=body, headers=headers)
                 else:
                     connection.request("GET", target, headers=headers)
                 response = connection.getresponse()

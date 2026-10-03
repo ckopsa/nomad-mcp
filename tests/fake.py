@@ -3,7 +3,7 @@
 No test talks to a real cluster. The fake listens on 127.0.0.1 or on a
 unix socket, answers the GET paths the tools read, and records every
 request it sees, method included, so a test can prove that nothing but
-GET ever left the client but the one allocation stop. Any other method or
+GET ever left the client but an allocation stop or a job register. Any other method or
 path is recorded and answered 405. A second namespace, doors, holds one
 job of its own.
 
@@ -371,6 +371,7 @@ class FakeNomad:
         self.requests = []
         self.execs = []  # (alloc, task, argv, stdin) for each exec that ran
         self.stops = []  # (alloc, namespace) for each allocation stop
+        self.registers = []  # (body, namespace) for each job register
         self.hung_up = threading.Event()  # set when a sleep exec saw the client close
         self.forbid = tuple(forbid)
         self.down = tuple(down)  # paths answered as a client the servers cannot reach
@@ -491,8 +492,14 @@ class FakeNomad:
                 self._answer(405, "method not allowed")
 
             def do_POST(self):
-                """The one write the client may send: an allocation stop."""
+                """The writes the client may send: an allocation stop, a job register."""
                 path, query = self._record()
+                if path == "/v1/jobs":
+                    body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                    fake.registers.append((body, query.get("namespace")))
+                    self._answer(200, {"EvalID": "e6e6e6e6-0000-0000-0000-%012d" % len(fake.registers),
+                                       "Index": 8, "JobModifyIndex": 8})
+                    return
                 parts = path.split("/")
                 if len(parts) == 5 and parts[1:3] == ["v1", "allocation"] and parts[4] == "stop":
                     fake.stops.append((parts[3], query.get("namespace")))
