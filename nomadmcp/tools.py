@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from . import execws, registry
+from . import execws, history, registry
 from .nomad import NomadError
 
 
@@ -49,6 +49,9 @@ HEXISH = re.compile(r"^[0-9a-f-]+$")
 ACTIVE_DEPLOYMENTS = ("running", "paused", "pending", "blocked", "unblocking", "initializing")
 # Allocation states that mean "this should be running and is not".
 TROUBLE_CLIENT = ("pending", "failed", "lost", "unknown")
+# The kept ends of allocations. __main__ swaps in the one that follows the
+# event stream.
+HISTORY = history.History()
 # Whether each pinned image is in its registry; cached five minutes per image.
 REGISTRY = registry.Registry()
 # The overview checks at most this many images of dead jobs, side by side.
@@ -547,6 +550,16 @@ def _alloc_row(alloc):
             "created": stamp(alloc.get("CreateTime")), "modified": stamp(alloc.get("ModifyTime"))}
 
 
+def _end_row(alloc):
+    """One kept end: the allocation's row, how it ended, and its last task events."""
+    row = _alloc_row(alloc)
+    if alloc.get("ClientDescription"):
+        row["description"] = clip(alloc["ClientDescription"])
+    row["events"] = {name: [task_event(e) for e in (state or {}).get("Events") or []]
+                     for name, state in (alloc.get("TaskStates") or {}).items()}
+    return row
+
+
 def _eval_row(evaluation):
     row = {"id": short(evaluation.get("ID")), "status": evaluation.get("Status"),
            "triggered_by": evaluation.get("TriggeredBy"), "job": evaluation.get("JobID"),
@@ -815,6 +828,11 @@ def job_status(client, args):
     answer["allocations"], note = capped([_alloc_row(a) for a in allocs], 10, "allocations")
     if note:
         notes.append(note + " (newest first)")
+    if not allocs:
+        # Nomad may have collected them; say what this server saw them end with.
+        ends = HISTORY.ends(client.namespace, job_id)
+        if ends:
+            answer["recent_ends"] = [_end_row(a) for a in ends[:5]]
     if job.get("Type") in ("service", "system"):
         deployment = _try(client, "/v1/job/%s/deployment" % _quote(job_id), notes=notes,
                           label="deployment")
@@ -959,6 +977,20 @@ def alloc_logs(client, args):
     return {"alloc": short(alloc_id), "job": alloc.get("JobID"), "task": task, "stream": stream,
             "client": alloc.get("ClientStatus"), "bytes": len(text.encode("utf-8")),
             "truncated_to_tail": truncated, "log": text}
+
+
+def alloc_history(client, args):
+    """The kept failed or lost ends of one job, newest first, with each task's
+    last events: what Nomad itself may have collected already."""
+    job = _text(args, "job", required=True)
+    ends = HISTORY.ends(client.namespace, job)
+    answer = {"job": job, "namespace": client.namespace, "ends": [_end_row(a) for a in ends]}
+    if not ends:
+        answer["note"] = ("no failed or lost end of this job is kept; the history follows the "
+                          "event stream from %s and keeps the newest %s per job for %s days"
+                          % (stamp(HISTORY.started * 1e9), history.KEEP_PER_JOB,
+                             history.KEEP_SECONDS // 86400))
+    return answer
 
 
 def _node_row(node):
@@ -1689,7 +1721,9 @@ TOOL_SPECS = [
             "datacenters, node pool, each group's count and each task's driver, image or "
             "command and resources; the newest allocations with their task states and "
             "restarts; the latest deployment's healthy and unhealthy counts; and the recent "
-            "evaluations that failed to place, with the reasons in words."
+            "evaluations that failed to place, with the reasons in words. When no allocation "
+            "is left, recent_ends gives the failed or lost ends this server kept, with their "
+            "last task events."
         ),
         "schema": _schema({"job": _JOB}, ["job"]),
     },
@@ -1729,6 +1763,17 @@ TOOL_SPECS = [
             "stream": {"type": "string", "enum": ["stderr", "stdout"]},
             "tail_bytes": {"type": "integer", "minimum": 1, "maximum": CEILING_TAIL},
         }, ["alloc"]),
+    },
+    {
+        "name": "alloc_history",
+        "function": alloc_history,
+        "description": (
+            "One job's allocations this server saw end failed or lost, newest first, each with "
+            "its node, task states and last 10 task events (exit codes, driver errors), kept "
+            "from the event stream after Nomad has garbage-collected them: the newest %s per "
+            "job for 7 days. Use it when job_status shows no allocation to read." % history.KEEP_PER_JOB
+        ),
+        "schema": _schema({"job": _JOB}, ["job"]),
     },
     {
         "name": "alloc_exec",
@@ -1948,7 +1993,7 @@ TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 
 # The tools that name a job or an allocation read in the namespace the call
 # names. list_jobs takes one too, and reads every listed one without it.
-NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_exec",
+NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_history", "alloc_exec",
               "job_restart", "job_revert", "var_put", "alloc_stop", "job_stop",
               "list_deployments", "evaluation")
 _NAMESPACE = {"type": "string", "description": (

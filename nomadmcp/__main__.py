@@ -16,7 +16,7 @@ import os
 import sys
 import urllib.request
 
-from . import mcp
+from . import history, mcp, tools
 from .nomad import Client
 
 
@@ -92,6 +92,8 @@ def main(argv=None):
     except ValueError as exc:
         print("configuration: %s" % exc, file=sys.stderr)
         return 2
+    tools.HISTORY = history.History.from_env()
+    tools.HISTORY.start(client)
     if args.stdio:
         mcp.serve_stdio(client)
         return 0

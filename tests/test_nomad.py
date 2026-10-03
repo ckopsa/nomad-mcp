@@ -87,7 +87,8 @@ class TestGetOnly(unittest.TestCase):
         client = Client(addr=nomad_fake.addr, token=fake.TOKEN)
         calls = [("cluster_overview", {}), ("list_jobs", {}), ("job_status", {"job": "web"}),
                  ("job_versions", {"job": "web"}), ("alloc_status", {"alloc": "a1b2c3"}),
-                 ("alloc_logs", {"alloc": "a1b2c3"}), ("list_nodes", {}),
+                 ("alloc_logs", {"alloc": "a1b2c3"}), ("alloc_history", {"job": "broken"}),
+                 ("list_nodes", {}),
                  ("node_status", {"node": "orangepi5plus"}), ("node_host", {"node": "orangepi5plus"}),
                  ("list_services", {}),
                  ("service", {"name": "web"}), ("list_variables", {}),

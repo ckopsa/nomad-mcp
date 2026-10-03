@@ -70,7 +70,7 @@ class TestHttp(TransportCase):
         listed = answer["result"]["tools"]
         self.assertEqual(sorted(t["name"] for t in listed), sorted([
             "cluster_overview", "list_jobs", "job_status", "job_versions", "alloc_status",
-            "alloc_logs", "list_nodes", "node_status", "node_host", "list_services", "service",
+            "alloc_logs", "alloc_history", "list_nodes", "node_status", "node_host", "list_services", "service",
             "list_variables", "list_deployments", "evaluation", "alloc_exec", "job_restart",
             "job_revert", "restart_allowlist", "var_put", "alloc_stop", "job_stop"]))
         for tool in listed:
