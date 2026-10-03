@@ -18,7 +18,12 @@ again with its own current spec, which it reads from Nomad itself and
 sends back byte for byte. It takes a job id and nothing else, so nothing
 about a job can be changed through it.
 
-THE THIRD WRITE also rides the POST: put_variable writes one variable's
+THE THIRD WRITE rides it too: revert_job asks Nomad to revert a job to an
+earlier version of its own. Its body holds the job id and two whole
+numbers, the version to go back to and the version the job must still be
+at, so no spec can be written through it.
+
+THE FOURTH WRITE also rides the POST: put_variable writes one variable's
 items back with check-and-set on the modify index they were read at, for
 var_put, which judges the path against its allow-list first. No error it
 raises carries a value.
@@ -90,7 +95,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Client:
-    """Reads the Nomad API with get. stop_alloc and reregister_job are its writes."""
+    """Reads the Nomad API with get. stop_alloc, reregister_job, revert_job and put_variable are its writes."""
 
     def __init__(self, addr=None, token=None, namespace=None, timeout=DEFAULT_TIMEOUT,
                  cacert=None, namespaces=None):
@@ -212,6 +217,24 @@ class Client:
             return json.loads(answer.decode("utf-8") or "null").get("ModifyIndex")
         except (ValueError, AttributeError):
             raise NomadError("the answer to POST %s is not a variable" % target, path=target)
+
+    def revert_job(self, job_id, version, prior_version):
+        """Reverts one job to an earlier version of its own (POST
+        /v1/job/:id/revert), which registers that version's spec as a new one.
+        EnforcePriorVersion is prior_version, so Nomad refuses the revert when
+        the job moved past it in the meantime. Only whole numbers go into the
+        body. Gives Nomad's answer (its EvalID)."""
+        for value in (version, prior_version):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise NomadError("a job version is a whole number, not %r" % (value,))
+        path = "/v1/job/%s/revert" % urllib.parse.quote(str(job_id), safe="")
+        body = json.dumps({"JobID": str(job_id), "JobVersion": version,
+                           "EnforcePriorVersion": prior_version}).encode("utf-8")
+        answer = self._send(path, None, True, body)
+        try:
+            return json.loads(answer.decode("utf-8") or "null")
+        except ValueError:
+            raise NomadError("the answer to POST %s is not JSON" % path, path=path)
 
     def _send(self, path, params, write, body=None):
         verb = "POST" if write else "GET"

@@ -380,6 +380,8 @@ class FakeNomad:
         self.execs = []  # (alloc, task, argv, stdin) for each exec that ran
         self.stops = []  # (alloc, namespace) for each allocation stop
         self.registers = []  # (body, namespace) for each job register
+        self.reverts = []  # (job, body, namespace) for each job revert
+        self.moved = {}  # job -> the version it holds now, as if changed since it was read
         self.hung_up = threading.Event()  # set when a sleep exec saw the client close
         self.forbid = tuple(forbid)
         self.down = tuple(down)  # paths answered as a client the servers cannot reach
@@ -501,7 +503,8 @@ class FakeNomad:
 
             def do_POST(self):
                 """The writes the client may send: an allocation stop, a job register,
-                a variable put with check-and-set (409 with the winner, as Nomad)."""
+                a job revert, a variable put with check-and-set (409 with the winner,
+                as Nomad)."""
                 path, query = self._record()
                 if path.startswith("/v1/var/"):
                     sent = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
@@ -520,6 +523,19 @@ class FakeNomad:
                                        "Index": 8, "JobModifyIndex": 8})
                     return
                 parts = path.split("/")
+                if len(parts) == 5 and parts[1:3] == ["v1", "job"] and parts[4] == "revert":
+                    job = urllib.parse.unquote(parts[3])
+                    body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                    fake.reverts.append((job, body, query.get("namespace")))
+                    specs = DOORS_SPECS if query.get("namespace") == "doors" else JOB_SPECS
+                    current = fake.moved.get(job, specs[job]["Version"])
+                    if body.get("EnforcePriorVersion") != current:
+                        self._answer(500, "current job has version %s; enforcing version %s"
+                                     % (current, body.get("EnforcePriorVersion")))
+                        return
+                    self._answer(200, {"EvalID": "e4e4e4e4-0000-0000-0000-%012d" % len(fake.reverts),
+                                       "Index": 9, "JobModifyIndex": 9})
+                    return
                 if len(parts) == 5 and parts[1:3] == ["v1", "allocation"] and parts[4] == "stop":
                     fake.stops.append((parts[3], query.get("namespace")))
                     self._answer(200, {"EvalID": "e5e5e5e5-0000-0000-0000-%012d" % len(fake.stops),

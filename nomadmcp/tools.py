@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from . import execws
+from . import execws, registry
 from .nomad import NomadError
 
 
@@ -46,6 +46,10 @@ HEXISH = re.compile(r"^[0-9a-f-]+$")
 ACTIVE_DEPLOYMENTS = ("running", "paused", "pending", "blocked", "unblocking", "initializing")
 # Allocation states that mean "this should be running and is not".
 TROUBLE_CLIENT = ("pending", "failed", "lost", "unknown")
+# Whether each pinned image is in its registry; cached five minutes per image.
+REGISTRY = registry.Registry()
+# The overview checks at most this many images of dead jobs, side by side.
+IMAGE_CHECKS = 16
 
 
 class Refusal(Exception):
@@ -500,6 +504,18 @@ def _task_brief(task):
     return entry
 
 
+def _images(job):
+    """The images a job's container tasks pin, in order, once each."""
+    refs = []
+    for group in job.get("TaskGroups") or []:
+        for task in group.get("Tasks") or []:
+            image = (task.get("Config") or {}).get("image")
+            if task.get("Driver") in ("docker", "podman") and isinstance(image, str) \
+                    and image not in refs:
+                refs.append(image)
+    return refs
+
+
 def _deployment_brief(deployment):
     if not deployment:
         return None
@@ -574,6 +590,7 @@ def cluster_overview(client, args):
         attention = []
         stopped = []
         parked = []
+        dead_images = []
         fetched = 0
         for job in jobs:
             if job.get("ParentID"):
@@ -597,17 +614,21 @@ def cluster_overview(client, args):
                 # tells a parked job from a broken one; the cap keeps a
                 # cluster full of dead jobs from costing a hundred reads.
                 wanted = None
+                images = []
                 if fetched < 60:
                     fetched += 1
                     spec = _try(client, "/v1/job/%s" % _quote(job.get("ID")))
                     if spec is not None:
                         wanted = sum(g.get("Count") or 0 for g in spec.get("TaskGroups") or [])
+                        images = _images(spec)
                 if wanted == 0 and job.get("Type") == "service":
                     parked.append(job.get("ID"))
                     continue
                 if job.get("Status") != "running":
                     problems.append("status %s, not stopped%s" % (
                         job.get("Status"), "" if wanted is None else ", spec asks for %s" % wanted))
+                    if job.get("Status") == "dead" and images:
+                        dead_images.append((problems, images))
                 else:
                     problems.append("no allocation running")
             if queued:
@@ -617,6 +638,16 @@ def cluster_overview(client, args):
             if problems:
                 attention.append({"job": job.get("ID"), "type": job.get("Type"),
                                   "status": job.get("Status"), "problems": problems})
+        # A dead job whose pinned tag is not in its registry cannot come back
+        # by a restart; say so, so nobody revives it by hand to find out.
+        refs = list(dict.fromkeys(ref for _, images in dead_images for ref in images))
+        if len(refs) > IMAGE_CHECKS:
+            notes.append("images of dead jobs: checked %s of %s" % (IMAGE_CHECKS, len(refs)))
+        checks = REGISTRY.check_many(refs[:IMAGE_CHECKS])
+        for problems, images in dead_images:
+            for ref in images:
+                if (checks.get(ref) or {}).get("image_present") is False:
+                    problems.append("image not in registry: %s" % ref)
         answer["jobs"] = {"total": len([j for j in jobs if not j.get("ParentID")]),
                           "needing_attention": attention,
                           "parked_count_0": sorted(parked),
@@ -768,6 +799,12 @@ def job_status(client, args):
             "tasks": {t.get("Name"): _task_brief(t) for t in group.get("Tasks") or []},
         }
     answer["groups"] = groups
+    checks = REGISTRY.check_many(_images(job))
+    for group in job.get("TaskGroups") or []:
+        for task in group.get("Tasks") or []:
+            image = (task.get("Config") or {}).get("image")
+            if isinstance(image, str) and image in checks:
+                groups[group.get("Name")]["tasks"][task.get("Name")].update(checks[image])
 
     allocs = _try(client, "/v1/job/%s/allocations" % _quote(job_id), notes=notes,
                   label="allocations") or []
@@ -1439,7 +1476,7 @@ def _var_put_allowed(client):
 
 
 def var_put(client, args):
-    """The third tool that changes anything. It sets one key of an
+    """The fourth tool that changes anything. It sets one key of an
     allow-listed variable: it reads the variable, sets the key and writes the
     items back with check-and-set on the modify index it read, so the other
     keys stay as they were and a concurrent write refuses. value is the
@@ -1474,6 +1511,57 @@ def var_put(client, args):
                       status=exc.status or None)
     print(line + " modify_index=%s" % index, file=sys.stderr)
     return {"path": path, "key": key, "namespace": namespace, "modify_index": index}
+
+
+# How far back job_revert may reach: a revert is for the version that ran a
+# moment ago, not for digging up an old one.
+REVERT_MAX_BACK = 10
+
+
+def job_revert(client, args):
+    """The third tool that changes anything. It rolls a job on the restart
+    allow-list back to an earlier version through Nomad's own revert, with
+    EnforcePriorVersion set to the version read just before, so a change that
+    lands in between is refused instead of overwritten. A target that is not
+    earlier than the current version, or more than REVERT_MAX_BACK versions
+    back, is refused before Nomad hears a write. The revert registers the
+    version after the one read, which EnforcePriorVersion holds."""
+    job = _text(args, "job", required=True)
+    namespace = client.namespace
+    allowed, source, _ = _restart_allowed(client)
+    if "%s/%s" % (namespace, job) not in allowed:
+        raise Refusal("job_not_allowed", job=job, namespace=namespace, allowlist=source)
+    version = args.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise Refusal("input", field="version", reason="a whole number of 0 or more is necessary")
+    why = _text(args, "why")
+    spec = _get(client, "/v1/job/%s" % _quote(job)) or {}
+    current = spec.get("Version")
+    if isinstance(current, bool) or not isinstance(current, int):
+        raise Refusal("nomad", reason="the job %s has no version" % job)
+    if version >= current:
+        raise Refusal("not_earlier", job=job, namespace=namespace, version=version, current=current)
+    if current - version > REVERT_MAX_BACK:
+        raise Refusal("too_old", job=job, namespace=namespace, version=version, current=current,
+                      oldest=current - REVERT_MAX_BACK)
+
+    def log(tail):
+        print("nomad-mcp revert job=%s namespace=%s from=%s to=%s why=%s%s" % (
+            job, namespace, current, version, json.dumps(why)[:300], tail), file=sys.stderr)
+
+    try:
+        answer = client.revert_job(job, version, current)
+    except NomadError as exc:
+        if "enforcing version" in (exc.reason or ""):
+            log(" refused=version_moved")
+            raise Refusal("version_moved", job=job, namespace=namespace, read=current,
+                          reason=exc.reason)
+        log(" refused=nomad")
+        raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+    evaluation = answer.get("EvalID") if isinstance(answer, dict) else None
+    log(" eval=%s" % evaluation)
+    return {"job": job, "namespace": namespace, "reverted_to": version, "from": current,
+            "version": current + 1, "eval": evaluation, "allowlist": source}
 
 
 # ------------------------------------------------------------------ specs
@@ -1613,6 +1701,27 @@ TOOL_SPECS = [
         }, ["job"]),
     },
     {
+        "name": "job_revert",
+        "function": job_revert,
+        "read_only": False,
+        "description": (
+            "Rolls a job on the restart allow-list back to an earlier version with Nomad's "
+            "revert, which registers that version's spec as a new version. It enforces the "
+            "version read just before, so a change made in between is refused "
+            "(version_moved), never overwritten. version must be earlier than the current "
+            "one and at most %s back; job_versions lists them. It answers the new version "
+            "and the evaluation at once; follow with job_status. why is one optional "
+            "sentence for the log. A job not on the allow-list is refused." % REVERT_MAX_BACK
+        ),
+        "schema": _schema({
+            "job": _JOB,
+            "version": {"type": "integer", "minimum": 0,
+                        "description": "The earlier version to go back to."},
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["job", "version"]),
+    },
+    {
         "name": "restart_allowlist",
         "function": restart_allowlist,
         "description": (
@@ -1728,7 +1837,7 @@ TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 # The tools that name a job or an allocation read in the namespace the call
 # names. list_jobs takes one too, and reads every listed one without it.
 NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_exec",
-              "job_restart", "var_put", "list_deployments", "evaluation")
+              "job_restart", "job_revert", "var_put", "list_deployments", "evaluation")
 _NAMESPACE = {"type": "string", "description": (
     "The Nomad namespace, one of those this server lists. Left out: the first listed, "
     "and an id prefix is looked up in every listed one; list_jobs lists them all.")}
