@@ -65,7 +65,7 @@ each job's namespace.
 | --- | --- |
 | `cluster_overview` | Start here. Leader, nodes, jobs not running as they should (a dead job parked at `count = 0` is listed apart), allocations stuck, failures of the last 24 h, deployments in motion or failed today, blocked evaluations with reasons, CSI plugin health. |
 | `list_jobs` | Jobs with type, status, pool and non-zero summary counts per group. |
-| `job_status` | One job: spec basics, groups and tasks (driver, image), newest allocations with task states, the latest deployment, evaluations that failed to place and why. |
+| `job_status` | One job: spec basics, groups and tasks (driver, image), newest allocations with task states, the latest deployment, evaluations that failed to place and why. Each container task's image is looked up in its registry (`HEAD /v2/<name>/manifests/<tag>`, with an anonymous token when the registry offers one, 3 s per check, cached 5 min per image) and carries `image_present` (`true`, `false`, or `"unknown"`), the HTTP `registry_status` and the `image_digest`. No registry credential is held or taken. `cluster_overview` names a dead job whose pinned image is missing: `image not in registry: <ref>`. |
 | `job_versions` | Recent versions with the diff from each one's predecessor as `old -> new` lines. |
 | `alloc_status` | One allocation: statuses and descriptions, each task's state, restarts and last events (exit codes, driver errors), resources, ports. |
 | `alloc_logs` | The tail of a task's stderr or stdout, 8000 bytes by default, 64000 at most. |
