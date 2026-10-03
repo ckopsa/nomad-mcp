@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from . import execws
+from . import execws, registry
 from .nomad import NomadError
 
 
@@ -45,6 +45,10 @@ HEXISH = re.compile(r"^[0-9a-f-]+$")
 ACTIVE_DEPLOYMENTS = ("running", "paused", "pending", "blocked", "unblocking", "initializing")
 # Allocation states that mean "this should be running and is not".
 TROUBLE_CLIENT = ("pending", "failed", "lost", "unknown")
+# Whether each pinned image is in its registry; cached five minutes per image.
+REGISTRY = registry.Registry()
+# The overview checks at most this many images of dead jobs, side by side.
+IMAGE_CHECKS = 16
 
 
 class Refusal(Exception):
@@ -499,6 +503,18 @@ def _task_brief(task):
     return entry
 
 
+def _images(job):
+    """The images a job's container tasks pin, in order, once each."""
+    refs = []
+    for group in job.get("TaskGroups") or []:
+        for task in group.get("Tasks") or []:
+            image = (task.get("Config") or {}).get("image")
+            if task.get("Driver") in ("docker", "podman") and isinstance(image, str) \
+                    and image not in refs:
+                refs.append(image)
+    return refs
+
+
 def _deployment_brief(deployment):
     if not deployment:
         return None
@@ -573,6 +589,7 @@ def cluster_overview(client, args):
         attention = []
         stopped = []
         parked = []
+        dead_images = []
         fetched = 0
         for job in jobs:
             if job.get("ParentID"):
@@ -596,17 +613,21 @@ def cluster_overview(client, args):
                 # tells a parked job from a broken one; the cap keeps a
                 # cluster full of dead jobs from costing a hundred reads.
                 wanted = None
+                images = []
                 if fetched < 60:
                     fetched += 1
                     spec = _try(client, "/v1/job/%s" % _quote(job.get("ID")))
                     if spec is not None:
                         wanted = sum(g.get("Count") or 0 for g in spec.get("TaskGroups") or [])
+                        images = _images(spec)
                 if wanted == 0 and job.get("Type") == "service":
                     parked.append(job.get("ID"))
                     continue
                 if job.get("Status") != "running":
                     problems.append("status %s, not stopped%s" % (
                         job.get("Status"), "" if wanted is None else ", spec asks for %s" % wanted))
+                    if job.get("Status") == "dead" and images:
+                        dead_images.append((problems, images))
                 else:
                     problems.append("no allocation running")
             if queued:
@@ -616,6 +637,16 @@ def cluster_overview(client, args):
             if problems:
                 attention.append({"job": job.get("ID"), "type": job.get("Type"),
                                   "status": job.get("Status"), "problems": problems})
+        # A dead job whose pinned tag is not in its registry cannot come back
+        # by a restart; say so, so nobody revives it by hand to find out.
+        refs = list(dict.fromkeys(ref for _, images in dead_images for ref in images))
+        if len(refs) > IMAGE_CHECKS:
+            notes.append("images of dead jobs: checked %s of %s" % (IMAGE_CHECKS, len(refs)))
+        checks = REGISTRY.check_many(refs[:IMAGE_CHECKS])
+        for problems, images in dead_images:
+            for ref in images:
+                if (checks.get(ref) or {}).get("image_present") is False:
+                    problems.append("image not in registry: %s" % ref)
         answer["jobs"] = {"total": len([j for j in jobs if not j.get("ParentID")]),
                           "needing_attention": attention,
                           "parked_count_0": sorted(parked),
@@ -767,6 +798,12 @@ def job_status(client, args):
             "tasks": {t.get("Name"): _task_brief(t) for t in group.get("Tasks") or []},
         }
     answer["groups"] = groups
+    checks = REGISTRY.check_many(_images(job))
+    for group in job.get("TaskGroups") or []:
+        for task in group.get("Tasks") or []:
+            image = (task.get("Config") or {}).get("image")
+            if isinstance(image, str) and image in checks:
+                groups[group.get("Name")]["tasks"][task.get("Name")].update(checks[image])
 
     allocs = _try(client, "/v1/job/%s/allocations" % _quote(job_id), notes=notes,
                   label="allocations") or []
