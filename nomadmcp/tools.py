@@ -14,7 +14,8 @@ stack trace.
 Nothing here writes but alloc_exec, which runs one command through
 execws for a job on its allow-list, and job_restart, which stops the
 running allocations of a job on its own allow-list through the client's
-one write, stop_alloc.
+one write, stop_alloc, and var_put, which sets one key of a variable on a
+third allow-list through put_variable and never answers or logs a value.
 """
 
 import copy
@@ -1357,17 +1358,21 @@ _clock = time.monotonic
 
 
 def _restart_variable(client):
-    """The entries of the restart variable, or None and the reason it could
-    not be read. Either is kept for RESTART_CACHE_SECONDS."""
+    return _listed_variable(client, RESTART_VARIABLE)
+
+
+def _listed_variable(client, path):
+    """The namespace/... entries of an allow-list variable, or None and the
+    reason it could not be read. Either is kept for RESTART_CACHE_SECONDS."""
     now = _clock()
-    cached = _restart_cache.get("variable")
+    cached = _restart_cache.get(path)
     if cached is not None and now - cached[0] < RESTART_CACHE_SECONDS:
         return cached[1], cached[2]
     scoped = copy.copy(client)
     scoped.namespace = RESTART_VARIABLE_NAMESPACE
     entries, reason = None, None
     try:
-        variable = scoped.get("/v1/var/%s" % RESTART_VARIABLE)
+        variable = scoped.get("/v1/var/%s" % path)
     except NomadError as exc:
         reason = exc.reason
     else:
@@ -1380,7 +1385,7 @@ def _restart_variable(client):
                         entries.add(entry.strip())
         else:
             reason = "the variable has no items"
-    _restart_cache["variable"] = (now, entries, reason)
+    _restart_cache[path] = (now, entries, reason)
     return entries, reason
 
 
@@ -1454,6 +1459,58 @@ def job_restart(client, args):
     log()
     return {"job": job, "namespace": namespace, "stopped": stopped, "evals": evals,
             "allowlist": source}
+
+
+# var_put's allow-list, read live like the restart list: namespace/path
+# entries (a namespace holds no slash, so the first one ends it), as keys or
+# comma-separated values. A path must match an entry exactly.
+VAR_PUT_VARIABLE = "nomad/jobs/nomad-mcp/var_put_paths"
+
+
+def _var_put_allowed(client):
+    entries, _ = _listed_variable(client, VAR_PUT_VARIABLE)
+    if entries is not None:
+        return entries, "variable"
+    env = os.environ.get("NOMAD_MCP_VAR_PUT_PATHS") or ""
+    return {e.strip() for e in env.split(",") if e.strip()}, "env"
+
+
+def var_put(client, args):
+    """The fourth tool that changes anything. It sets one key of an
+    allow-listed variable: it reads the variable, sets the key and writes the
+    items back with check-and-set on the modify index it read, so the other
+    keys stay as they were and a concurrent write refuses. value is the
+    engine's secret, put in by the gate in front of this server; it is never
+    logged and never answered."""
+    path = _text(args, "path", required=True).strip("/")
+    key = _text(args, "key", required=True)
+    value = args.get("value")
+    if not isinstance(value, str) or not value:
+        raise Refusal("input", field="value", reason="a text is necessary")
+    namespace = client.namespace
+    allowed, source = _var_put_allowed(client)
+    if "%s/%s" % (namespace, path) not in allowed:
+        raise Refusal("path_not_allowed", path=path, namespace=namespace, allowlist=source)
+    why = _text(args, "why")
+    try:
+        current = client.get("/v1/var/%s" % quote(path, safe="/"))
+    except NomadError as exc:
+        if exc.status != 404:
+            raise Refusal("nomad", reason=exc.reason, status=exc.status or None)
+        current = None
+    current = current if isinstance(current, dict) else {}
+    items = dict(current.get("Items") or {})
+    items[key] = value
+    line = "nomad-mcp var_put namespace=%s path=%s key=%s why=%s" % (
+        namespace, path, key, json.dumps(why)[:300])
+    try:
+        index = client.put_variable(path, items, current.get("ModifyIndex") or 0)
+    except NomadError as exc:
+        print(line + " refused=nomad", file=sys.stderr)
+        raise Refusal("conflict" if exc.status == 409 else "nomad", reason=exc.reason,
+                      status=exc.status or None)
+    print(line + " modify_index=%s" % index, file=sys.stderr)
+    return {"path": path, "key": key, "namespace": namespace, "modify_index": index}
 
 
 # How far back job_revert may reach: a revert is for the version that ran a
@@ -1675,6 +1732,27 @@ TOOL_SPECS = [
         "schema": _schema(),
     },
     {
+        "name": "var_put",
+        "function": var_put,
+        "read_only": False,
+        "description": (
+            "Sets one key of a Nomad variable whose namespace/path is on the var_put allow-list "
+            "(the variable nomad/jobs/nomad-mcp/var_put_paths, else NOMAD_MCP_VAR_PUT_PATHS). "
+            "It reads the variable, sets the key and writes it back with check-and-set, so the "
+            "other keys stay and a concurrent write refuses (conflict). It answers path, key, "
+            "namespace and the new modify_index, never a value. why is one optional sentence for the log."
+        ),
+        "schema": _schema({
+            "path": {"type": "string", "description": "The variable path, for example nomad/jobs/waymark-bench."},
+            "key": {"type": "string", "description": "The one item key to set."},
+            "value": {"type": "string", "minLength": 1, "x-secret-ref": True, "description": (
+                "The value: a reference to the owner's secret, which the engine substitutes. "
+                "Never logged or answered.")},
+            "why": {"type": "string", "description": (
+                "One sentence for the log. Optional: a gate in front of this server may hold the why itself.")},
+        }, ["path", "key", "value"]),
+    },
+    {
         "name": "list_nodes",
         "function": list_nodes,
         "description": "Lists the client nodes: name, status, eligibility, drain, pool, address, "
@@ -1759,7 +1837,7 @@ TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 # The tools that name a job or an allocation read in the namespace the call
 # names. list_jobs takes one too, and reads every listed one without it.
 NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_exec",
-              "job_restart", "job_revert", "list_deployments", "evaluation")
+              "job_restart", "job_revert", "var_put", "list_deployments", "evaluation")
 _NAMESPACE = {"type": "string", "description": (
     "The Nomad namespace, one of those this server lists. Left out: the first listed, "
     "and an id prefix is looked up in every listed one; list_jobs lists them all.")}
