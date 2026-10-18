@@ -3,6 +3,12 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "unittest name tests.<module>[.Class[.test]]; empty runs all"
+        required: false
+        default: ""
 
 jobs:
   tests:
@@ -14,4 +20,9 @@ jobs:
           python-version: "3.11"
       # No install step: the server and its tests are the standard library.
       - name: Run the tests
-        run: python -m unittest -v
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          if [ -z "${ONLY:-}" ]; then exec python -m unittest -v; fi
+          [[ "$ONLY" =~ ^tests(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] || { echo "bad only: $ONLY" >&2; exit 2; }
+          python -m unittest -v "$ONLY"
