@@ -119,6 +119,34 @@ class TestAllocations(ToolCase):
         answer = self.call("alloc_status", alloc="a1b2c3d4", events=1)
         self.assertEqual(len(answer["tasks"]["server"]["events"]), 1)
 
+    def test_alloc_stats_reads_cpu_throttling_and_memory_of_a_job(self):
+        answer = self.call("alloc_stats", job="web", task="server", why="it answers slowly")
+        self.assertEqual(answer["alloc"], "a1b2c3d4")
+        self.assertEqual(answer["job"], "web")
+        cpu = answer["tasks"]["server"]["cpu"]
+        self.assertEqual((cpu["percent"], cpu["mhz"], cpu["reserved_mhz"], cpu["of_reserved_percent"]),
+                         (87.5, 350.0, 200, 175.0))
+        self.assertEqual((cpu["throttled_periods"], cpu["throttled_seconds"]), (1200, 45.0))
+        memory = answer["tasks"]["server"]["memory"]
+        self.assertEqual((memory["rss_mb"], memory["reserved_mb"], memory["limit_mb"]), (300, 256, 512))
+        self.assertEqual(memory["rss_of_limit_percent"], 58.6)
+        pids = answer["tasks"]["server"]["busiest_pids"]
+        self.assertEqual([(p["pid"], p["cpu_percent"]) for p in pids], [("7", 70.0), ("9", 17.5)])
+        self.assertNotIn("total", answer)
+        self.assertEqual({m for m, p, q, t in self.nomad.requests}, {"GET"})
+        stats = [p for m, p, q, t in self.nomad.requests if p.startswith("/v1/client/allocation/")]
+        self.assertEqual(stats, ["/v1/client/allocation/%s/stats" % fake.ALLOC_WEB])
+
+    def test_alloc_stats_by_alloc_gives_every_task_and_the_total(self):
+        answer = self.call("alloc_stats", alloc="a1b2c3")
+        self.assertEqual(sorted(answer["tasks"]), ["server"])
+        self.assertEqual(answer["total"]["cpu"]["percent"], 87.5)
+        self.assertEqual(self.refuse("alloc_stats", alloc="a1b2c3", task="nope")["tasks"], ["server"])
+        self.assertEqual(self.refuse("alloc_stats")["refused"], "input")
+        self.assertEqual(self.refuse("alloc_stats", job="pair", alloc="a1b2c3")["refused"],
+                         "alloc_not_in_job")
+        self.assertEqual(self.refuse("alloc_stats", alloc=fake.ALLOC_PAIR[:8])["refused"], "nomad")
+
     def test_an_odd_prefix_is_sent_even_and_narrowed_here(self):
         self.call("alloc_status", alloc="a1b2c")
         sent = [q.get("prefix") for m, p, q, t in self.nomad.requests if p == "/v1/allocations"]

@@ -979,6 +979,115 @@ def alloc_logs(client, args):
             "truncated_to_tail": truncated, "log": text}
 
 
+# The processes alloc_stats names per task, busiest first.
+STATS_TOP_PIDS = 5
+
+
+def _round(value, places=1):
+    return round(value, places) if _number(value) else None
+
+
+def _usage(usage, reserved=None):
+    """One ResourceUsage as CPU and memory, against the task's reservation."""
+    usage = usage or {}
+    cpu = usage.get("CpuStats") or {}
+    memory = usage.get("MemoryStats") or {}
+    throttled = cpu.get("ThrottledTime")
+    row = {
+        "cpu": {"percent": _round(cpu.get("Percent")), "mhz": _round(cpu.get("TotalTicks")),
+                "user_percent": _round(cpu.get("UserMode")),
+                "system_percent": _round(cpu.get("SystemMode")),
+                "throttled_periods": cpu.get("ThrottledPeriods"),
+                "throttled_seconds": _round(throttled / 1e9, 3) if _number(throttled) else None},
+        "memory": {"rss_mb": _megabytes(memory.get("RSS")), "usage_mb": _megabytes(memory.get("Usage")),
+                   "max_usage_mb": _megabytes(memory.get("MaxUsage")),
+                   "cache_mb": _megabytes(memory.get("Cache")), "swap_mb": _megabytes(memory.get("Swap"))},
+    }
+    if cpu.get("Measured"):
+        row["cpu"]["measured"] = cpu["Measured"]
+    if memory.get("Measured"):
+        row["memory"]["measured"] = memory["Measured"]
+    reserved = reserved or {}
+    mhz = reserved.get("cpu_mhz")
+    if mhz:
+        row["cpu"]["reserved_mhz"] = mhz
+        if _number(cpu.get("TotalTicks")):
+            row["cpu"]["of_reserved_percent"] = _round(100.0 * cpu["TotalTicks"] / mhz)
+    if reserved.get("memory_mb"):
+        row["memory"]["reserved_mb"] = reserved["memory_mb"]
+        # The task is killed past MemoryMaxMB when set, else past MemoryMB.
+        limit = reserved.get("memory_max_mb") or reserved["memory_mb"]
+        row["memory"]["limit_mb"] = limit
+        if row["memory"]["rss_mb"] is not None:
+            row["memory"]["rss_of_limit_percent"] = _round(100.0 * row["memory"]["rss_mb"] / limit)
+    return row
+
+
+def _busiest_pids(pids):
+    rows = []
+    for pid, usage in (pids or {}).items():
+        usage = (usage or {})
+        cpu = usage.get("CpuStats") or {}
+        rows.append({"pid": str(pid), "cpu_percent": _round(cpu.get("Percent")),
+                     "rss_mb": _megabytes((usage.get("MemoryStats") or {}).get("RSS"))})
+    rows.sort(key=lambda r: r["cpu_percent"] or 0, reverse=True)
+    return rows[:STATS_TOP_PIDS]
+
+
+def alloc_stats(client, args):
+    """Read-only: CPU, throttling and memory from the client's own stats
+    (GET /v1/client/allocation/:id/stats). No command runs in the task, so
+    it reaches every job the server can read, with no exec allow-list."""
+    job = _text(args, "job")
+    task = _text(args, "task")
+    if args.get("alloc"):
+        alloc_id = resolve(client, "allocation", args.get("alloc"))
+    elif job:
+        running = [a for a in _get(client, "/v1/job/%s/allocations" % _quote(job)) or []
+                   if a.get("ClientStatus") == "running"]
+        if not running:
+            raise Refusal("no_running_alloc", job=job)
+        alloc_id = max(running, key=lambda a: a.get("CreateTime") or 0)["ID"]
+    else:
+        raise Refusal("input", field="job", reason="name a job or an allocation")
+    alloc = _get(client, "/v1/allocation/%s" % alloc_id)
+    if job and alloc.get("JobID") != job:
+        raise Refusal("alloc_not_in_job", job=job, alloc=short(alloc_id), alloc_job=alloc.get("JobID"))
+    try:
+        stats = client.get("/v1/client/allocation/%s/stats" % alloc_id) or {}
+    except NomadError as exc:
+        raise Refusal("nomad", reason=exc.reason, status=exc.status or None,
+                      hint="stats are read from the client node: an allocation that is not "
+                           "running, or a node that is down, has none")
+    reserved = {}
+    for name, res in ((alloc.get("AllocatedResources") or {}).get("Tasks") or {}).items():
+        res = res or {}
+        memory = res.get("Memory") or {}
+        reserved[name] = {"cpu_mhz": (res.get("Cpu") or {}).get("CpuShares"),
+                          "memory_mb": memory.get("MemoryMB"), "memory_max_mb": memory.get("MemoryMaxMB")}
+    task_stats = stats.get("Tasks") or {}
+    if task is not None and task not in task_stats:
+        raise Refusal("input", field="task", reason="no such task in the allocation's stats",
+                      tasks=sorted(task_stats))
+    tasks = {}
+    for name in sorted(task_stats):
+        if task is not None and name != task:
+            continue
+        entry = task_stats[name] or {}
+        row = _usage(entry.get("ResourceUsage"), reserved.get(name))
+        # Per-process figures come only from drivers that run an executor
+        # (exec, raw_exec, java); a docker task has none.
+        if entry.get("Pids"):
+            row["busiest_pids"] = _busiest_pids(entry["Pids"])
+        tasks[name] = row
+    answer = {"alloc": short(alloc_id), "job": alloc.get("JobID"), "node": alloc.get("NodeName"),
+              "client": alloc.get("ClientStatus"), "read_at": stamp(stats.get("Timestamp")),
+              "tasks": tasks}
+    if task is None:
+        answer["total"] = _usage(stats.get("ResourceUsage"))
+    return answer
+
+
 def alloc_history(client, args):
     """The kept failed or lost ends of one job, newest first, with each task's
     last events: what Nomad itself may have collected already."""
@@ -1336,8 +1445,13 @@ def alloc_exec(client, args):
     """The one tool that changes anything. The allow-list is judged before
     Nomad hears a word, and the allocation must be the job's own."""
     job = _text(args, "job", required=True)
-    if job not in exec_jobs():
-        raise Refusal("job_not_allowed", job=job)
+    allowed = exec_jobs()
+    if job not in allowed:
+        raise Refusal("job_not_allowed", job=job, allowed=sorted(allowed), reason=(
+            "alloc_exec reaches only the jobs on this server's own list (NOMAD_MCP_EXEC_JOBS), "
+            "set in its deployment on purpose; a seat's grant or scope cannot widen it, so do "
+            "not ask the owner for one. alloc_stats reads a task's CPU, throttling and memory "
+            "for any job without exec."))
     argv = args.get("command")
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         raise Refusal("input", field="command", reason="an argv array of texts is necessary")
@@ -1776,6 +1890,26 @@ TOOL_SPECS = [
         "schema": _schema({"job": _JOB}, ["job"]),
     },
     {
+        "name": "alloc_stats",
+        "function": alloc_stats,
+        "description": (
+            "Read-only resource use of one allocation from Nomad's client stats; no command "
+            "runs in the task and no exec allow-list applies. Per task: CPU percent and MHz "
+            "used against the reserved MHz, user and system percent, throttled periods and "
+            "throttled seconds (counters since the task started), memory RSS, usage, max "
+            "usage, cache and swap against the reservation and the limit, and the busiest "
+            "processes when the driver reports them (exec, raw_exec; not docker). Name a job "
+            "(its newest running allocation) or an alloc; task narrows to one task. why is "
+            "one optional sentence for the log."
+        ),
+        "schema": _schema({
+            "job": _JOB,
+            "alloc": _ALLOC,
+            "task": {"type": "string", "description": "The task name inside the allocation."},
+            "why": {"type": "string", "description": "One sentence for the log. Optional."},
+        }),
+    },
+    {
         "name": "alloc_exec",
         "function": alloc_exec,
         "read_only": False,
@@ -1785,7 +1919,8 @@ TOOL_SPECS = [
             "command is an argv array with no shell: pass [\"sh\", \"-c\", \"...\"] for one. "
             "alloc defaults to the job's newest running allocation; task may be left out when "
             "there is one. timeout_seconds is 60 by default and 300 at most. There is no TTY. "
-            "why is one optional sentence for the log. A job not on the allow-list is refused."
+            "why is one optional sentence for the log. A job not on this server's own "
+            "allow-list is refused with the jobs it allows; for CPU and memory use alloc_stats."
         ),
         "schema": _schema({
             "job": _JOB,
@@ -1993,7 +2128,8 @@ TOOLS = {spec["name"]: spec for spec in TOOL_SPECS}
 
 # The tools that name a job or an allocation read in the namespace the call
 # names. list_jobs takes one too, and reads every listed one without it.
-NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_history", "alloc_exec",
+NAMESPACED = ("job_status", "job_versions", "alloc_status", "alloc_logs", "alloc_history", "alloc_stats",
+              "alloc_exec",
               "job_restart", "job_revert", "var_put", "alloc_stop", "job_stop",
               "list_deployments", "evaluation")
 _NAMESPACE = {"type": "string", "description": (

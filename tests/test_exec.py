@@ -29,7 +29,10 @@ class TestAllocExec(ToolCase):
 
     def test_a_job_not_on_the_list_is_refused_without_a_nomad_call(self):
         answer = self.refuse("alloc_exec", job="broken", command=["id"], why="a test")
-        self.assertEqual(answer, {"refused": "job_not_allowed", "job": "broken"})
+        self.assertEqual((answer["refused"], answer["job"], answer["allowed"]),
+                         ("job_not_allowed", "broken", ["pair", "web"]))
+        self.assertIn("this server's own list", answer["reason"])
+        self.assertIn("alloc_stats", answer["reason"])
         with mock.patch.dict(os.environ, {"NOMAD_MCP_EXEC_JOBS": ""}):
             answer = self.refuse("alloc_exec", job="web", command=["id"], why="a test")
         self.assertEqual(answer["refused"], "job_not_allowed")
