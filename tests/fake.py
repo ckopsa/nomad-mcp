@@ -119,6 +119,26 @@ for _a in ALLOCS + DOORS_ALLOCS:
         "Shared": {"DiskMB": 300, "Ports": [{"Label": "http", "Value": 8080, "To": 80,
                                              "HostIP": "192.168.1.40"}]}}
 
+_MB = 1024 * 1024
+
+
+def _usage(percent, ticks, rss_mb, throttled_periods=0, throttled_ns=0):
+    return {"CpuStats": {"Percent": percent, "TotalTicks": ticks, "UserMode": percent - 7.5,
+                         "SystemMode": 7.5, "ThrottledPeriods": throttled_periods,
+                         "ThrottledTime": throttled_ns, "Measured": ["Percent", "Throttled Time"]},
+            "MemoryStats": {"RSS": rss_mb * _MB, "Usage": (rss_mb + 100) * _MB,
+                            "MaxUsage": (rss_mb + 180) * _MB, "Cache": 100 * _MB, "Swap": 0,
+                            "Measured": ["RSS", "Usage", "Max Usage"]}}
+
+
+# What the client answers for web's running allocation, task server.
+ALLOC_STATS = {
+    "ResourceUsage": _usage(87.5, 350.0, 300, 1200, 45 * 10 ** 9), "Timestamp": NOW_NS,
+    "Tasks": {"server": {"ResourceUsage": _usage(87.5, 350.0, 300, 1200, 45 * 10 ** 9),
+                         "Timestamp": NOW_NS,
+                         "Pids": {"9": _usage(17.5, 70.0, 100), "7": _usage(70.0, 280.0, 200)}}},
+}
+
 JOBS = [
     _job_stub("web", web={"Running": 1, "Failed": 40}),
     _job_stub("broken", status="dead", main={"Failed": 3}),
@@ -317,6 +337,9 @@ def routes(path, query):
         ident = path.split("/")[3]
         found = [a for a in ALLOCS if a["ID"] == ident]
         return (200, found[0]) if found else (404, "alloc not found")
+    if path.startswith("/v1/client/allocation/") and path.endswith("/stats"):
+        ident = path.split("/")[4]
+        return (200, ALLOC_STATS) if ident == ALLOC_WEB else (500, "unknown allocation ID")
     if path.startswith("/v1/client/fs/logs/"):
         ident = path.split("/")[5]
         alloc = next((a for a in ALLOCS if a["ID"] == ident), None)
