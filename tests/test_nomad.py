@@ -88,7 +88,7 @@ class TestGetOnly(unittest.TestCase):
         calls = [("cluster_overview", {}), ("list_jobs", {}), ("job_status", {"job": "web"}),
                  ("job_versions", {"job": "web"}), ("alloc_status", {"alloc": "a1b2c3"}),
                  ("alloc_logs", {"alloc": "a1b2c3"}), ("alloc_history", {"job": "broken"}),
-                 ("list_nodes", {}),
+                 ("alloc_stats", {"alloc": "a1b2c3"}), ("list_nodes", {}),
                  ("node_status", {"node": "orangepi5plus"}), ("node_host", {"node": "orangepi5plus"}),
                  ("list_services", {}),
                  ("service", {"name": "web"}), ("list_variables", {}),
